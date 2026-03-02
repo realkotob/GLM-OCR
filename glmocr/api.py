@@ -524,6 +524,12 @@ class GlmOcr:
             **kwargs,
         )
 
+    def get_queue_stats(self) -> Optional[Dict[str, int]]:
+        """Return current pipeline queue sizes, or ``None`` if unavailable."""
+        if self._pipeline is not None:
+            return self._pipeline.get_queue_stats()
+        return None
+
     def close(self):
         """Close the parser and release resources."""
         if self._pipeline:

@@ -88,6 +88,7 @@ class Pipeline:
         self.max_workers = config.max_workers
         self._page_maxsize = getattr(config, "page_maxsize", 100)
         self._region_maxsize = getattr(config, "region_maxsize", 800)
+        self._current_state: Optional[PipelineState] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -122,10 +123,17 @@ class Pipeline:
             yield self._process_passthrough(request_data, layout_vis_output_dir)
             return
 
+        num_units = len(image_urls)
+        original_inputs = make_original_inputs(image_urls)
+
         state = PipelineState(
             page_maxsize=page_maxsize or self._page_maxsize,
             region_maxsize=region_maxsize or self._region_maxsize,
         )
+        self._current_state = state
+
+        tracker = UnitTracker(num_units)
+        state.set_tracker(tracker)
 
         t1 = threading.Thread(
             target=data_loading_worker,
@@ -147,27 +155,26 @@ class Pipeline:
         t2.start()
         t3.start()
 
-        # Wait for loading & layout to finish so we know the total counts.
-        t1.join()
-        t2.join()
-
-        num_images = state.num_images_loaded[0]
-        num_units = len(image_urls)
-        original_inputs = make_original_inputs(image_urls)
-
-        if num_images == 0:
-            yield from self._emit_empty(num_units, original_inputs, layout_vis_output_dir)
+        try:
+            yield from self._emit_results(state, tracker, original_inputs, layout_vis_output_dir)
+            t1.join()
+            t2.join()
             t3.join()
             state.raise_if_exceptions()
-            return
+        finally:
+            self._current_state = None
 
-        tracker = self._build_tracker(state, num_units, num_images)
-        state.set_tracker(tracker)
-
-        yield from self._emit_results(state, tracker, original_inputs, layout_vis_output_dir)
-
-        t3.join()
-        state.raise_if_exceptions()
+    def get_queue_stats(self) -> Optional[Dict[str, int]]:
+        """Return current queue sizes, or ``None`` if no processing is active."""
+        state = self._current_state
+        if state is None:
+            return None
+        return {
+            "page_queue_size": state.page_queue.qsize(),
+            "page_queue_maxsize": state.page_queue.maxsize,
+            "region_queue_size": state.region_queue.qsize(),
+            "region_queue_maxsize": state.region_queue.maxsize,
+        }
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -219,47 +226,6 @@ class Pipeline:
             layout_vis_dir=layout_vis_output_dir,
         )
 
-    @staticmethod
-    def _build_tracker(
-        state: PipelineState,
-        num_units: int,
-        num_images: int,
-    ) -> UnitTracker:
-        """Build and backfill a UnitTracker from the current state."""
-        unit_indices = state.unit_indices_holder[0]
-        unit_image_indices: List[List[int]] = [[] for _ in range(num_units)]
-        for page_idx in range(num_images):
-            if unit_indices is not None and page_idx < len(unit_indices):
-                u = unit_indices[page_idx]
-                if u < num_units:
-                    unit_image_indices[u].append(page_idx)
-
-        unit_region_count = [
-            sum(len(state.layout_results_dict.get(i, [])) for i in unit_image_indices[u])
-            for u in range(num_units)
-        ]
-
-        tracker = UnitTracker(num_units, unit_image_indices, unit_region_count)
-        already_done = state.snapshot_recognition_results()
-        tracker.backfill([r["page_idx"] for r in already_done])
-        return tracker
-
-    def _emit_empty(
-        self,
-        num_units: int,
-        original_inputs: List[str],
-        layout_vis_output_dir: Optional[str],
-    ) -> Generator[PipelineResult, None, None]:
-        """Yield empty results when no images were loaded."""
-        empty_json, empty_md = self.result_formatter.process([])
-        for u in range(num_units):
-            yield PipelineResult(
-                json_result=empty_json,
-                markdown_result=empty_md,
-                original_images=[original_inputs[u]],
-                layout_vis_dir=layout_vis_output_dir,
-            )
-
     def _emit_results(
         self,
         state: PipelineState,
@@ -267,19 +233,33 @@ class Pipeline:
         original_inputs: List[str],
         layout_vis_output_dir: Optional[str],
     ) -> Generator[PipelineResult, None, None]:
-        """Wait for units to complete and yield their formatted results."""
+        """Wait for units to complete and yield their formatted results.
+
+        A unit enters the ready queue when:
+          - ``finalize_unit`` has been called (region count is known), AND
+          - all its regions have been recognised (``on_region_done`` counter
+            reached the target).
+
+        ``None`` from the ready queue signals a pipeline error (shutdown).
+        """
         emitted: set = set()
         while len(emitted) < tracker.num_units:
             u = tracker.wait_next_ready_unit()
+            if u is None:
+                break
             if u in emitted:
                 continue
 
-            results = state.snapshot_recognition_results()
+            region_count = tracker.unit_region_count[u]
+            if region_count is None:
+                tracker._ready_queue.put(u)
+                continue
 
+            results = state.snapshot_recognition_results()
             page_indices = tracker.unit_image_indices[u]
             page_set = set(page_indices)
             count = sum(1 for r in results if r["page_idx"] in page_set)
-            if count < tracker.unit_region_count[u]:
+            if count < region_count:
                 tracker._ready_queue.put(u)
                 continue
 

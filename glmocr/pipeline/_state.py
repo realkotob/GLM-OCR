@@ -2,7 +2,7 @@
 
 This object is created once per ``Pipeline.process()`` call and passed to
 all three worker threads.  It holds the inter-thread queues, accumulated
-results, and the (optional) UnitTracker reference.
+results, and the UnitTracker reference.
 """
 
 from __future__ import annotations
@@ -46,12 +46,25 @@ class PipelineState:
         self._recognition_results: List[Dict[str, Any]] = []
         self._results_lock = threading.Lock()
 
-        # ── UnitTracker (set by main thread after stage 1 & 2 join) ──
+        # ── UnitTracker (set before threads start) ───────────────────
         self._tracker: Optional[UnitTracker] = None
 
         # ── Exception collection ─────────────────────────────────────
         self._exceptions: List[Dict[str, Any]] = []
         self._exception_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Page registration (delegated to tracker)
+    # ------------------------------------------------------------------
+
+    def register_page(self, page_idx: int, unit_idx: int) -> None:
+        """Register a ``page_idx → unit_idx`` mapping in the tracker.
+
+        Called by the data-loading worker (t1) for every loaded page.
+        """
+        tracker = self._tracker
+        if tracker is not None:
+            tracker.register_page(page_idx, unit_idx)
 
     # ------------------------------------------------------------------
     # Recognition results
@@ -76,7 +89,23 @@ class PipelineState:
     # ------------------------------------------------------------------
 
     def set_tracker(self, tracker: UnitTracker) -> None:
+        """Attach *tracker* to the shared state.
+
+        Must be called **before** any worker thread is started so that
+        ``register_page``, ``finalize_unit``, and ``on_region_done`` are
+        never no-ops.
+        """
         self._tracker = tracker
+
+    def finalize_unit(self, unit_idx: int, region_count: int) -> None:
+        """Delegate to the tracker's ``finalize_unit`` if a tracker is attached.
+
+        Called by the layout worker (t2) after it has processed all pages of
+        *unit_idx*.
+        """
+        tracker = self._tracker
+        if tracker is not None:
+            tracker.finalize_unit(unit_idx, region_count)
 
     # ------------------------------------------------------------------
     # Exception handling
@@ -85,6 +114,9 @@ class PipelineState:
     def record_exception(self, source: str, exc: Exception) -> None:
         with self._exception_lock:
             self._exceptions.append({"source": source, "exception": exc})
+        tracker = self._tracker
+        if tracker is not None:
+            tracker.signal_shutdown()
 
     def raise_if_exceptions(self) -> None:
         with self._exception_lock:

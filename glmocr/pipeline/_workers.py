@@ -7,7 +7,10 @@ Stage 3 (recognition_worker):    Parallel OCR         → recognition_results
 Queue message formats:
 
     page_queue::
-        {"identifier": "image",  "page_idx": int, "image": PIL.Image}
+        {"identifier": "image",     "page_idx": int, "unit_idx": int,
+         "image": PIL.Image}
+        {"identifier": "unit_done", "unit_idx": int}   ← all pages for this
+                                                          unit have been queued
         {"identifier": "done"}
         {"identifier": "error"}
 
@@ -29,6 +32,7 @@ from glmocr.pipeline._common import (
     IDENTIFIER_ERROR,
     IDENTIFIER_IMAGE,
     IDENTIFIER_REGION,
+    IDENTIFIER_UNIT_DONE,
 )
 from glmocr.pipeline._state import PipelineState
 from glmocr.utils.image_utils import crop_image_region
@@ -50,21 +54,63 @@ def data_loading_worker(
     page_loader: "PageLoader",
     image_urls: List[str],
 ) -> None:
-    """Load pages from *image_urls* and push them onto ``state.page_queue``."""
+    """Load pages from *image_urls* and push them onto ``state.page_queue``.
+
+    For each page that is loaded, ``state.register_page()`` is called
+    **before** the page message is enqueued, so that the tracker's
+    ``page → unit`` mapping is always available by the time Stage 3 calls
+    ``on_region_done``.
+
+    After all pages for each input URL (unit) have been enqueued, a
+    ``IDENTIFIER_UNIT_DONE`` sentinel is sent so that the layout worker can
+    call ``state.finalize_unit()`` without waiting for *all* units to finish.
+
+    Units that produce zero pages (e.g. broken URLs) still receive a
+    ``UNIT_DONE`` sentinel so the tracker can finalise them with
+    ``region_count=0``.
+    """
+    num_units = len(image_urls)
     page_idx = 0
     unit_indices_list: List[int] = []
+    prev_unit_idx: Optional[int] = None
+    sent_unit_done: set = set()
     try:
         for page, unit_idx in page_loader.iter_pages_with_unit_indices(image_urls):
+            if prev_unit_idx is not None and unit_idx != prev_unit_idx:
+                state.page_queue.put({
+                    "identifier": IDENTIFIER_UNIT_DONE,
+                    "unit_idx": prev_unit_idx,
+                })
+                sent_unit_done.add(prev_unit_idx)
+
+            state.register_page(page_idx, unit_idx)
             state.images_dict[page_idx] = page
             state.page_queue.put({
                 "identifier": IDENTIFIER_IMAGE,
                 "page_idx": page_idx,
+                "unit_idx": unit_idx,
                 "image": page,
             })
             unit_indices_list.append(unit_idx)
             page_idx += 1
             state.num_images_loaded[0] = page_idx
             state.unit_indices_holder[0] = list(unit_indices_list)
+            prev_unit_idx = unit_idx
+
+        if prev_unit_idx is not None:
+            state.page_queue.put({
+                "identifier": IDENTIFIER_UNIT_DONE,
+                "unit_idx": prev_unit_idx,
+            })
+            sent_unit_done.add(prev_unit_idx)
+
+        for u in range(num_units):
+            if u not in sent_unit_done:
+                state.page_queue.put({
+                    "identifier": IDENTIFIER_UNIT_DONE,
+                    "unit_idx": u,
+                })
+
         state.page_queue.put({"identifier": IDENTIFIER_DONE})
     except Exception as e:
         logger.exception("Data loading worker error: %s", e)
@@ -84,11 +130,22 @@ def layout_worker(
     save_visualization: bool,
     vis_output_dir: Optional[str],
 ) -> None:
-    """Consume pages, run layout detection in batches, push regions."""
+    """Consume pages, run layout detection in batches, push regions.
+
+    When a ``IDENTIFIER_UNIT_DONE`` sentinel arrives from Stage 1, the
+    current batch is flushed immediately (it contains the last pages for
+    that unit) and ``state.finalize_unit()`` is called with the total
+    region count for that unit.  This lets the main thread start emitting
+    results for the completed unit without waiting for later units.
+    """
     try:
         batch_images: List[Any] = []
         batch_page_indices: List[int] = []
+        batch_unit_indices: List[int] = []
         global_start_idx = 0
+
+        # page_indices seen so far per unit, used to compute region counts.
+        unit_page_indices: Dict[int, List[int]] = {}
 
         while True:
             try:
@@ -99,15 +156,46 @@ def layout_worker(
             identifier = msg["identifier"]
 
             if identifier == IDENTIFIER_IMAGE:
+                unit_idx = msg["unit_idx"]
                 batch_images.append(msg["image"])
                 batch_page_indices.append(msg["page_idx"])
+                batch_unit_indices.append(unit_idx)
+                if unit_idx not in unit_page_indices:
+                    unit_page_indices[unit_idx] = []
+                unit_page_indices[unit_idx].append(msg["page_idx"])
+
                 if len(batch_images) >= layout_detector.batch_size:
                     _flush_layout_batch(
                         state, layout_detector, batch_images, batch_page_indices,
                         save_visualization, vis_output_dir, global_start_idx,
                     )
                     global_start_idx += len(batch_page_indices)
-                    batch_images, batch_page_indices = [], []
+                    batch_images, batch_page_indices, batch_unit_indices = [], [], []
+
+            elif identifier == IDENTIFIER_UNIT_DONE:
+                unit_idx = msg["unit_idx"]
+                # Flush any remaining pages in the batch (they all belong to
+                # this unit since t1 sends UNIT_DONE after the last page).
+                if batch_images:
+                    _flush_layout_batch(
+                        state, layout_detector, batch_images, batch_page_indices,
+                        save_visualization, vis_output_dir, global_start_idx,
+                    )
+                    global_start_idx += len(batch_page_indices)
+                    batch_images, batch_page_indices, batch_unit_indices = [], [], []
+
+                # All pages for this unit have been layout-detected; compute
+                # total region count and tell the tracker.
+                pages_for_unit = unit_page_indices.get(unit_idx, [])
+                region_count = sum(
+                    len(state.layout_results_dict.get(pi, []))
+                    for pi in pages_for_unit
+                )
+                state.finalize_unit(unit_idx, region_count)
+                logger.debug(
+                    "Unit %d finalised: %d pages, %d regions",
+                    unit_idx, len(pages_for_unit), region_count,
+                )
 
             elif identifier == IDENTIFIER_DONE:
                 if batch_images:
@@ -170,13 +258,19 @@ def recognition_worker(
 ) -> None:
     """Consume regions, run parallel OCR, store results."""
     try:
-        executor = ThreadPoolExecutor(max_workers=min(max_workers, 128))
+        concurrency = min(max_workers, 128)
+        executor = ThreadPoolExecutor(max_workers=concurrency)
         futures: Dict[Any, Dict[str, Any]] = {}
         pending_skip: List[Dict[str, Any]] = []
         processing_complete = False
 
         while True:
             _collect_done_futures(futures, state)
+
+            if len(futures) >= concurrency:
+                _wait_for_any(futures)
+                _collect_done_futures(futures, state)
+                continue
 
             try:
                 msg = state.region_queue.get(timeout=0.01)
