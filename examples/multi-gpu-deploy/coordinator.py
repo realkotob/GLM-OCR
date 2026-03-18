@@ -450,8 +450,11 @@ class Coordinator:
             pbar = None
 
         last_total = 0
+        dead_engines: set = set()
 
         while not self._shutdown:
+            self._check_engines(dead_engines)
+
             all_done = True
             total_completed = 0
             total_failed = 0
@@ -504,6 +507,22 @@ class Coordinator:
 
         if pbar:
             pbar.close()
+
+    def _check_engines(self, dead_engines: set) -> None:
+        """Check engine processes and kill workers whose engine has died."""
+        for gpu_id, proc in self.engine_procs.items():
+            if gpu_id in dead_engines:
+                continue
+            if proc.poll() is not None:
+                dead_engines.add(gpu_id)
+                print(
+                    f"\n  [ERROR] Engine on GPU {gpu_id} crashed "
+                    f"(exit code: {proc.returncode}). "
+                    f"Killing worker for GPU {gpu_id}..."
+                )
+                worker = self.worker_procs.get(gpu_id)
+                if worker and worker.poll() is None:
+                    self._kill_proc(worker)
 
     # ------------------------------------------------------------------
     # Summary
