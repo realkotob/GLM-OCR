@@ -45,27 +45,21 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 60  # seconds
 API_GUIDE_URL = "https://open.bigmodel.cn/usercenter/apikeys"
+OFFICIAL_API_URL = "https://open.bigmodel.cn/api/paas/v4/layout_parsing"
 
 # =============================================================================
 # Environment
 # =============================================================================
 
 
-def _get_env(key: str, *fallback_keys: str) -> str:
-    """Get environment variable with fallback keys."""
-    value = os.getenv(key, "").strip()
-    if value:
-        return value
-    for fallback in fallback_keys:
-        value = os.getenv(fallback, "").strip()
-        if value:
-            return value
-    return ""
+def _get_env(key: str) -> str:
+    """Get an environment variable value."""
+    return os.getenv(key, "").strip()
 
 
 def get_config() -> tuple[str, str]:
     """
-    Get API URL and key from environment.
+    Get API key from environment and use fixed official API URL.
 
     Returns:
         tuple of (api_url, api_key)
@@ -73,23 +67,15 @@ def get_config() -> tuple[str, str]:
     Raises:
         ValueError: If not configured
     """
-    api_url = _get_env("GLM_OCR_API_URL")
-    api_key = _get_env("ZHIPU_API_KEY") or _get_env("GLM_OCR_API_KEY")
-
-    # Set default URL if not configured
-    if not api_url:
-        api_url = "https://open.bigmodel.cn/api/paas/v4/layout_parsing"
+    api_key = _get_env("ZHIPU_API_KEY")
 
     if not api_key:
         raise ValueError(
             f"ZHIPU_API_KEY not configured. Get your API key at: {API_GUIDE_URL}"
         )
 
-    # Normalize URL
-    if not api_url.startswith(("http://", "https://")):
-        api_url = f"https://{api_url}"
-
-    return api_url, api_key
+    # Security: fixed official endpoint (no custom URL override).
+    return OFFICIAL_API_URL, api_key
 
 
 # =============================================================================
@@ -214,7 +200,10 @@ def _make_api_request(api_url: str, api_key: str, payload: dict) -> dict:
 
 
 def extract_text(
-    image_source: str, model: str = "glm-ocr", **options
+    image_source: str,
+    model: str = "glm-ocr",
+    include_raw_result: bool = False,
+    **options,
 ) -> dict[str, Any]:
     """
     Extract text from image or PDF using GLM-OCR layout parsing API.
@@ -233,7 +222,7 @@ def extract_text(
             "ok": True,
             "text": "OCR extracted text (md_results)...",
             "layout_details": [...],  # Layout analysis results
-            "result": { raw API result },
+            "result": { raw API result } or null,
             "error": None,
             "source": "original source",
             "source_type": "url" or "file"
@@ -293,10 +282,11 @@ def extract_text(
         "ok": True,
         "text": extracted_text,
         "layout_details": layout_details,
-        "result": result,
+        "result": result if include_raw_result else None,
         "error": None,
         "source": image_source,
         "source_type": "url" if is_url else "file",
+        "raw_result_included": include_raw_result,
     }
 
 
@@ -332,6 +322,7 @@ def _error(code: str, message: str, source: str) -> dict:
         "error": {"code": code, "message": message},
         "source": source,
         "source_type": "url" if _is_url(source) else "file",
+        "raw_result_included": False,
     }
 
 
@@ -356,7 +347,7 @@ Examples:
   python scripts/glm_ocr_cli.py --file photo.png --output result.json --pretty
 
 Configuration:
-  Set env var: ZHIPU_API_KEY (or legacy: GLM_OCR_API_KEY)
+    Set env var: ZHIPU_API_KEY
   Get your key: https://bigmodel.cn/usercenter/proj-mgmt/apikeys
         """,
     )
@@ -373,6 +364,11 @@ Configuration:
     parser.add_argument(
         "--output", "-o", metavar="FILE", help="Save result to JSON file"
     )
+    parser.add_argument(
+        "--include-raw",
+        action="store_true",
+        help="Include raw upstream API response in output JSON (off by default)",
+    )
 
     args = parser.parse_args()
 
@@ -380,7 +376,7 @@ Configuration:
     source = args.file_url or args.file
 
     # Extract text
-    result = extract_text(image_source=source)
+    result = extract_text(image_source=source, include_raw_result=args.include_raw)
 
     # Format output
     indent = 2 if args.pretty else None
