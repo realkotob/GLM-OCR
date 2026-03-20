@@ -18,7 +18,7 @@ metadata:
     homepage: https://github.com/zai-org/GLM-OCR/tree/main/skills/glmocr-handwriting
 ---
 
-# GLM-V Handwriting Recognition Skill / GLM-V 手写体识别技能
+# GLM-OCR Handwriting Recognition Skill / GLM-OCR 手写体识别技能
 
 Recognize handwritten text from images and PDFs using the ZhiPu GLM-OCR layout parsing API.
 

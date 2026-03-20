@@ -18,7 +18,7 @@ metadata:
     homepage: https://github.com/zai-org/GLM-OCR/tree/main/skills/glmocr-formula
 ---
 
-# GLM-V Formula Recognition Skill / GLM-V 公式识别技能
+# GLM-OCR Formula Recognition Skill / GLM-OCR 公式识别技能
 
 Recognize mathematical formulas from images and PDFs and convert them to LaTeX format using the ZhiPu GLM-OCR layout parsing API.
 

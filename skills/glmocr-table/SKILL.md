@@ -18,7 +18,7 @@ metadata:
     homepage: https://github.com/zai-org/GLM-OCR/tree/main/skills/glmocr-table
 ---
 
-# GLM-V Table Recognition Skill / GLM-V 表格识别技能
+# GLM-OCR Table Recognition Skill / GLM-OCR 表格识别技能
 
 Extract tables from images and PDFs and convert them to Markdown format using the ZhiPu GLM-OCR layout parsing API.
 
