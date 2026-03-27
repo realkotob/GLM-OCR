@@ -1,12 +1,17 @@
 """Image processing utilities."""
 
 import io
-import base64
+import fitz
 import math
+import base64
 from io import BytesIO
 
 import numpy as np
 from PIL import Image, ImageDraw
+
+from glmocr.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 def smart_resize(
@@ -250,53 +255,50 @@ def image_tensor_to_base64(image_tensor, image_format):
 
 
 # -----------------------------------------------------------------------------
-# PDF rendering via pypdfium2
+# PDF rendering via PyMuPDF (fitz)
 # -----------------------------------------------------------------------------
 
-try:
-    import pypdfium2 as _pdfium  # noqa: F401
 
-    PYPDFIUM2_AVAILABLE = True
-except ImportError:
-    PYPDFIUM2_AVAILABLE = False
-
-
-def _page_to_image(page, dpi: int = 200, max_width_or_height: int = 3500):
-    """Render a PDF page to PIL Image (pypdfium2).
+def _render_page_to_pil(page, dpi: int = 200, max_width_or_height: int = 3500):
+    """Render a PDF page to PIL Image via PyMuPDF.
 
     Args:
-        page: pypdfium2 PdfPage.
+        page: fitz.Page object.
         dpi: Render DPI.
-        max_width_or_height: Max width or height.
+        max_width_or_height: Cap on the longer side in pixels.
 
     Returns:
         (PIL.Image, scale_factor)
     """
     scale = dpi / 72.0
-    width, height = page.get_size()
-    long_side_length = max(width, height)
-    if (long_side_length * scale) > max_width_or_height:
-        scale = max_width_or_height / long_side_length
-    bitmap = page.render(scale=scale)
-    image = bitmap.to_pil()
-    try:
-        bitmap.close()
-    except Exception:
-        pass
+    rect = page.rect
+    long_side_pt = max(rect.width, rect.height)
+    if long_side_pt * scale > max_width_or_height:
+        scale = max_width_or_height / long_side_pt
+    mat = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
     return image, scale
 
 
+def _open_pdf(source):
+    """Open a PDF from a file path (str) or raw bytes."""
+    if isinstance(source, bytes):
+        return fitz.open(stream=source, filetype="pdf")
+    return fitz.open(source)
+
+
 def pdf_to_images_pil(
-    pdf_path: str,
+    source,
     dpi: int = 200,
     max_width_or_height: int = 3500,
     start_page_id: int = 0,
     end_page_id: int = None,
 ) -> list:
-    """Convert PDF to list of PIL Images using pypdfium2 (single-process).
+    """Convert PDF to list of PIL Images.
 
     Args:
-        pdf_path: PDF file path.
+        source: PDF file path (str) or raw PDF bytes.
         dpi: Render DPI.
         max_width_or_height: Max width or height.
         start_page_id: Start page index (0-based).
@@ -305,38 +307,29 @@ def pdf_to_images_pil(
     Returns:
         List of PIL.Image.
     """
-    if not PYPDFIUM2_AVAILABLE:
-        raise ImportError(
-            "PDF support requires pypdfium2. Install with: pip install pypdfium2"
-        )
-    import pypdfium2 as pdfium
-
-    pdf = None
+    doc = None
     try:
-        pdf = pdfium.PdfDocument(pdf_path)
-        page_count = len(pdf)
+        doc = _open_pdf(source)
+        page_count = doc.page_count
         if end_page_id is None or end_page_id < 0:
             end_page_id = page_count - 1
         if end_page_id >= page_count:
             end_page_id = page_count - 1
         images = []
         for i in range(start_page_id, end_page_id + 1):
-            page = pdf[i]
-            try:
-                image, _ = _page_to_image(
-                    page, dpi=dpi, max_width_or_height=max_width_or_height
-                )
-                images.append(image)
-            finally:
-                page.close()
+            page = doc.load_page(i)
+            image, _ = _render_page_to_pil(
+                page, dpi=dpi, max_width_or_height=max_width_or_height
+            )
+            images.append(image)
         return images
     finally:
-        if pdf is not None:
-            pdf.close()
+        if doc is not None:
+            doc.close()
 
 
 def pdf_to_images_pil_iter(
-    pdf_path: str,
+    source,
     dpi: int = 200,
     max_width_or_height: int = 3500,
     start_page_id: int = 0,
@@ -348,7 +341,7 @@ def pdf_to_images_pil_iter(
     downstream can start processing before the whole PDF is loaded.
 
     Args:
-        pdf_path: PDF file path.
+        source: PDF file path (str) or raw PDF bytes.
         dpi: Render DPI.
         max_width_or_height: Max width or height.
         start_page_id: Start page index (0-based).
@@ -357,29 +350,30 @@ def pdf_to_images_pil_iter(
     Yields:
         PIL.Image per page.
     """
-    if not PYPDFIUM2_AVAILABLE:
-        raise ImportError(
-            "PDF support requires pypdfium2. Install with: pip install pypdfium2"
-        )
-    import pypdfium2 as pdfium
-
-    pdf = None
+    doc = None
+    label = source if isinstance(source, str) else "<bytes>"
     try:
-        pdf = pdfium.PdfDocument(pdf_path)
-        page_count = len(pdf)
+        doc = _open_pdf(source)
+        page_count = doc.page_count
         if end_page_id is None or end_page_id < 0:
             end_page_id = page_count - 1
         if end_page_id >= page_count:
             end_page_id = page_count - 1
         for i in range(start_page_id, end_page_id + 1):
-            page = pdf[i]
             try:
-                image, _ = _page_to_image(
+                page = doc.load_page(i)
+            except Exception as e:
+                logger.warning("Skipping page %d of '%s': %s", i, label, e)
+                continue
+            try:
+                image, _ = _render_page_to_pil(
                     page, dpi=dpi, max_width_or_height=max_width_or_height
                 )
                 yield image
-            finally:
-                page.close()
+            except Exception as e:
+                logger.warning(
+                    "Skipping page %d of '%s' (render failed): %s", i, label, e
+                )
     finally:
-        if pdf is not None:
-            pdf.close()
+        if doc is not None:
+            doc.close()

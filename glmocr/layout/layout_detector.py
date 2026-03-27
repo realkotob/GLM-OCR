@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import TYPE_CHECKING, List, Dict, Optional
+from typing import TYPE_CHECKING, List, Dict
 
+import cv2
 import torch
 import numpy as np
 from PIL import Image
@@ -16,7 +16,7 @@ from transformers import (
 from glmocr.layout.base import BaseLayoutDetector
 from glmocr.utils.layout_postprocess_utils import apply_layout_postprocess
 from glmocr.utils.logging import get_logger
-from glmocr.utils.visualization_utils import save_layout_visualization
+from glmocr.utils.visualization_utils import draw_layout_boxes
 
 if TYPE_CHECKING:
     from glmocr.config import LayoutConfig
@@ -78,6 +78,54 @@ class PPDocLayoutDetector(BaseLayoutDetector):
         self._model = self._model.to(self._device)
         if self.id2label is None:
             self.id2label = self._model.config.id2label
+
+        # Patch upstream _extract_polygon_points_by_masks to guard against
+        # empty mask crops that crash cv2.resize with !ssize.empty().
+        def _safe_extract(boxes, masks, scale_ratio):
+            scale_w, scale_h = scale_ratio[0] / 4, scale_ratio[1] / 4
+            mask_h, mask_w = masks.shape[1:]
+            polygon_points = []
+
+            for i in range(len(boxes)):
+                x_min, y_min, x_max, y_max = boxes[i].astype(np.int32)
+                box_w, box_h = x_max - x_min, y_max - y_min
+                rect = np.array(
+                    [[x_min, y_min], [x_max, y_min], [x_max, y_max], [x_min, y_max]],
+                    dtype=np.float32,
+                )
+
+                if box_w <= 0 or box_h <= 0:
+                    polygon_points.append(rect)
+                    continue
+
+                x_start = int(round((x_min * scale_w).item()))
+                x_end = int(round((x_max * scale_w).item()))
+                x_start, x_end = np.clip([x_start, x_end], 0, mask_w)
+                y_start = int(round((y_min * scale_h).item()))
+                y_end = int(round((y_max * scale_h).item()))
+                y_start, y_end = np.clip([y_start, y_end], 0, mask_h)
+
+                cropped_mask = masks[i, y_start:y_end, x_start:x_end]
+                if cropped_mask.size == 0:
+                    polygon_points.append(rect)
+                    continue
+
+                resized = cv2.resize(
+                    cropped_mask.astype(np.uint8),
+                    (box_w, box_h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                polygon = self._image_processor._mask2polygon(resized)
+                if polygon is not None and len(polygon) < 4:
+                    polygon_points.append(rect)
+                    continue
+                if polygon is not None and len(polygon) > 0:
+                    polygon = polygon + np.array([x_min, y_min])
+                polygon_points.append(polygon)
+
+            return polygon_points
+
+        self._image_processor._extract_polygon_points_by_masks = _safe_extract
         logger.debug(f"PP-DocLayoutV3 loaded on device: {self._device}")
 
     def stop(self):
@@ -215,31 +263,30 @@ class PPDocLayoutDetector(BaseLayoutDetector):
         self,
         images: List[Image.Image],
         save_visualization: bool = False,
-        visualization_output_dir: Optional[str] = None,
         global_start_idx: int = 0,
-    ) -> List[List[Dict]]:
+        use_polygon: bool = False,
+    ) -> tuple:
         """Batch-detect layout regions in-process.
 
         Args:
             images: List of PIL Images.
-            save_visualization: Whether to also save visualization.
-            visualization_output_dir: Where to save visualization outputs.
-            global_start_idx: Start index for visualization filenames (layout_page{N}).
+            save_visualization: Whether to generate visualization images.
+            global_start_idx: Start index for visualization page numbering.
+            use_polygon: Use polygon masks for visualization and cropping.
 
         Returns:
-            List[List[Dict]]: Detection results per image.
+            Tuple of (results, vis_images) where *results* is
+            ``List[List[Dict]]`` and *vis_images* is
+            ``Dict[int, PIL.Image.Image]`` mapping global page index to
+            the rendered layout visualization (empty dict when disabled).
         """
         if self._model is None:
             raise RuntimeError("Layout detector not started. Call start() first.")
 
         num_images = len(images)
-        image_batch = []
-        for image in images:
-            image_width, image_height = image.size
-            image_array = np.array(image.convert("RGB"))
-            image_batch.append((image_array, image_width, image_height))
-
-        pil_images = [Image.fromarray(img[0]) for img in image_batch]
+        pil_images = [
+            img.convert("RGB") if img.mode != "RGB" else img for img in images
+        ]
         all_paddle_format_results = []
 
         for chunk_start in range(0, num_images, self.batch_size):
@@ -255,28 +302,6 @@ class PPDocLayoutDetector(BaseLayoutDetector):
             target_sizes = torch.tensor(
                 [img.size[::-1] for img in chunk_pil], device=self._device
             )
-            try:
-                if hasattr(outputs, "pred_boxes") and outputs.pred_boxes is not None:
-                    pred_boxes = outputs.pred_boxes
-                    if hasattr(outputs, "out_masks") and outputs.out_masks is not None:
-                        mask_h, mask_w = outputs.out_masks.shape[-2:]
-                    else:
-                        mask_h, mask_w = 200, 200
-                    min_norm_w = 1.0 / mask_w
-                    min_norm_h = 1.0 / mask_h
-                    box_wh = pred_boxes[..., 2:4]
-                    valid_mask = (box_wh[..., 0] > min_norm_w) & (
-                        box_wh[..., 1] > min_norm_h
-                    )
-                    if hasattr(outputs, "logits") and outputs.logits is not None:
-                        invalid_mask = ~valid_mask
-                        if invalid_mask.any():
-                            outputs.logits.masked_fill_(
-                                invalid_mask.unsqueeze(-1), -100.0
-                            )
-            except Exception as e:
-                logger.warning("Pre-filter failed (%s), continuing...", e)
-
             if self.threshold_by_class:
                 # Use the lowest threshold (per-class or global fallback)
                 # so post-processing doesn't discard valid detections early.
@@ -307,28 +332,19 @@ class PPDocLayoutDetector(BaseLayoutDetector):
                 del inputs, outputs, raw_results
                 torch.cuda.empty_cache()
 
-        saved_vis_paths = []
-        if save_visualization and visualization_output_dir:
-            vis_output_path = Path(visualization_output_dir)
-            vis_output_path.mkdir(parents=True, exist_ok=True)
+        vis_images: Dict[int, Image.Image] = {}
+        if save_visualization:
             for img_idx, img_results in enumerate(all_paddle_format_results):
                 vis_img = np.array(pil_images[img_idx])
-                save_filename = f"layout_page{global_start_idx + img_idx}.jpg"
-                save_path = vis_output_path / save_filename
-                save_layout_visualization(
+                vis_images[global_start_idx + img_idx] = draw_layout_boxes(
                     image=vis_img,
                     boxes=img_results,
-                    save_path=str(save_path),
-                    show_label=True,
-                    show_score=True,
-                    show_index=True,
+                    use_polygon=use_polygon,
                 )
-                saved_vis_paths.append(str(save_path))
 
         all_results = []
         for img_idx, paddle_results in enumerate(all_paddle_format_results):
-            image_width = image_batch[img_idx][1]
-            image_height = image_batch[img_idx][2]
+            image_width, image_height = pil_images[img_idx].size
             results = []
             valid_index = 0
             for item in paddle_results:
@@ -371,4 +387,4 @@ class PPDocLayoutDetector(BaseLayoutDetector):
                 valid_index += 1
             all_results.append(results)
 
-        return all_results
+        return all_results, vis_images

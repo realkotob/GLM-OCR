@@ -8,14 +8,18 @@ Two modes are supported:
 2. Self-hosted Mode (maas.enabled=false): Uses local vLLM/SGLang service.
    Requires GPU; SDK handles layout detection, parallel OCR, etc.
 
+Supported input types: file paths (``str``), ``pathlib.Path``, raw ``bytes``
+(image or PDF content), and URLs (file://, http://, data:).
+
 Agent-friendly usage::
 
     # Only needs ZHIPU_API_KEY in environment (or pass api_key directly)
     from glmocr import GlmOcr
 
     parser = GlmOcr(api_key="sk-xxx", mode="maas")
-    results = parser.parse("document.png")
-    print(results[0].to_dict())
+    result = parser.parse("document.png")
+    result = parser.parse(open("doc.pdf", "rb").read())   # bytes
+    print(result.to_dict())
 """
 
 import os
@@ -26,6 +30,7 @@ from pathlib import Path
 from glmocr.config import load_config
 from glmocr.parser_result import PipelineResult
 from glmocr.utils.logging import get_logger, ensure_logging_configured
+from glmocr.utils.markdown_utils import resolve_image_regions
 
 logger = get_logger(__name__)
 
@@ -51,8 +56,10 @@ class GlmOcr:
         # --- Classic: YAML-based ---
         parser = glmocr.GlmOcr(config_path="config.yaml")
 
-        # --- Parse ---
-        results = parser.parse("image.png")
+        # --- Parse (paths, bytes, or mixed) ---
+        result = parser.parse("image.png")
+        result = parser.parse(open("doc.pdf", "rb").read())
+        results = parser.parse(["img.png", pdf_bytes])
         for r in results:
             print(r.markdown_result)
             print(r.to_dict())           # structured, JSON-serialisable
@@ -70,7 +77,6 @@ class GlmOcr:
         model: Optional[str] = None,
         mode: Optional[str] = None,
         timeout: Optional[int] = None,
-        enable_layout: Optional[bool] = None,
         log_level: Optional[str] = None,
         env_file: Optional[str] = None,
         # Extra knobs for self-hosted mode & GPU binding
@@ -78,6 +84,7 @@ class GlmOcr:
         ocr_api_port: Optional[int] = None,
         cuda_visible_devices: Optional[str] = None,
         layout_device: Optional[str] = None,
+        **kwargs: Any,
     ):
         """Initialize GlmOcr.
 
@@ -94,7 +101,6 @@ class GlmOcr:
                       If *api_key* is provided without an explicit *mode*,
                       mode defaults to ``"maas"``.
             timeout:  Request timeout in seconds.
-            enable_layout: Whether to run layout detection.
             log_level: Logging level (DEBUG, INFO, WARNING, ERROR).
             env_file: Path to a ``.env`` file to load API key and other settings from.
             layout_device: Device for the layout model: ``"cpu"``, ``"cuda"``,
@@ -118,13 +124,13 @@ class GlmOcr:
             model=model,
             mode=mode,
             timeout=timeout,
-            enable_layout=enable_layout,
             log_level=log_level,
             env_file=env_file,
             ocr_api_host=ocr_api_host,
             ocr_api_port=ocr_api_port,
             cuda_visible_devices=cuda_visible_devices,
             layout_device=layout_device,
+            **kwargs,
         )
         # Apply logging config for API/SDK usage.
         ensure_logging_configured(
@@ -143,21 +149,50 @@ class GlmOcr:
 
             self._maas_client = MaaSClient(self.config_model.pipeline.maas)
             self._maas_client.start()
-            self.enable_layout = True  # MaaS always includes layout
             logger.info("GLM-OCR initialized in MaaS mode (cloud API passthrough)")
         else:
             # Self-hosted mode: use full Pipeline
             from glmocr.pipeline import Pipeline
 
             self._pipeline = Pipeline(config=self.config_model.pipeline)
-            self.enable_layout = self._pipeline.enable_layout
             self._pipeline.start()
             logger.info("GLM-OCR initialized in self-hosted mode")
+
+    # ------------------------------------------------------------------
+    # Input normalisation helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_url(image: Union[str, Path]) -> str:
+        """Convert a path/URL to a ``file://`` URL."""
+        if isinstance(image, Path):
+            return f"file://{image.absolute()}"
+        if isinstance(image, str):
+            if image.startswith(("http://", "https://", "data:", "file://")):
+                return image
+            return f"file://{Path(image).absolute()}"
+        raise TypeError(f"Unsupported image type: {type(image)}")
+
+    @staticmethod
+    def _maas_source(image: Union[str, bytes, Path]):
+        """Return ``(source, display_name)`` suitable for the MaaS client."""
+        if isinstance(image, bytes):
+            return image, "<bytes>"
+        if isinstance(image, Path):
+            return str(image), str(image)
+        if isinstance(image, str) and image.startswith("file://"):
+            p = image[7:]
+            return p, p
+        return image, str(image)
+
+    # ------------------------------------------------------------------
+    # parse() and overloads
+    # ------------------------------------------------------------------
 
     @overload
     def parse(
         self,
-        images: str,
+        images: Union[str, bytes, Path],
         *,
         stream: Literal[False] = ...,
         save_layout_visualization: bool = ...,
@@ -167,7 +202,7 @@ class GlmOcr:
     @overload
     def parse(
         self,
-        images: List[str],
+        images: List[Union[str, bytes, Path]],
         *,
         stream: Literal[False] = ...,
         save_layout_visualization: bool = ...,
@@ -177,7 +212,7 @@ class GlmOcr:
     @overload
     def parse(
         self,
-        images: Union[str, List[str]],
+        images: Union[str, bytes, Path, List[Union[str, bytes, Path]]],
         *,
         stream: Literal[True],
         save_layout_visualization: bool = ...,
@@ -186,64 +221,73 @@ class GlmOcr:
 
     def parse(
         self,
-        images: Union[str, List[str]],
+        images: Union[str, bytes, Path, List[Union[str, bytes, Path]]],
         *,
         stream: bool = False,
         save_layout_visualization: bool = True,
+        preserve_order: bool = True,
         **kwargs: Any,
     ) -> Union[
         PipelineResult, List[PipelineResult], Generator[PipelineResult, None, None]
     ]:
-        """Predict / parse images or documents.
+        """Parse images or documents.
 
-        Supports local paths and URLs (file://, http://, https://, data:).
-        Supports image files (jpg, png, bmp, gif, webp) and PDF files.
+        Accepts file paths, URLs, ``pathlib.Path`` objects, or raw ``bytes``
+        (image or PDF content).  Format is auto-detected from magic bytes.
 
         Args:
-            images: Image path/URL — a single ``str`` or a ``list`` of strings.
-            stream: If ``True``, yields one :class:`PipelineResult` at a time (avoids
-                holding all results in memory). If ``False``, returns a single result
-                or a list, depending on *images*.
+            images: A single input or a list.  Each element can be:
+
+                * ``str``   – local path or URL (file://, http://, data:)
+                * ``bytes`` – raw image / PDF bytes
+                * ``Path``  – ``pathlib.Path`` to a file
+
+            stream: If ``True``, yields one :class:`PipelineResult` at a time.
             save_layout_visualization: Whether to save layout visualization artifacts.
+            preserve_order: Whether to keep output order consistent with input order.
             **kwargs: Additional parameters for MaaS mode (return_crop_images,
                      need_layout_visualization, start_page_id, end_page_id, etc.)
 
         Returns:
-            - When ``stream=False`` (default): a single ``PipelineResult`` if *images*
-              is a ``str``, or a ``List[PipelineResult]`` if *images* is a list.
-            - When ``stream=True``: a generator that yields one ``PipelineResult``
-              per input.
+            - ``stream=False``, single input → ``PipelineResult``
+            - ``stream=False``, list input  → ``List[PipelineResult]``
+            - ``stream=True``               → ``Generator[PipelineResult, ...]``
 
-        Example:
-            # Single file — returns one PipelineResult
+        Examples::
+
             result = parser.parse("image.png")
-            result.save(output_dir="./output")
-
-            # Multiple files — returns a list
-            results = parser.parse(["img1.png", "doc.pdf"])
-
-            # Stream to avoid large in-memory results
-            for r in parser.parse(["a.pdf", "b.pdf"], stream=True):
-                r.save(output_dir="./output")
+            result = parser.parse(Path("image.png"))
+            result = parser.parse(open("image.png", "rb").read())
+            results = parser.parse(["img1.png", pdf_bytes])
         """
-        _single = isinstance(images, str)
+        _single = isinstance(images, (str, bytes, Path))
         if _single:
             images = [images]
 
         if stream:
-            return self._parse_stream(images, save_layout_visualization, **kwargs)
+            return self._parse_stream(
+                images,
+                save_layout_visualization,
+                preserve_order=preserve_order,
+                **kwargs,
+            )
 
         if self._use_maas:
             result_list = self._parse_maas(images, save_layout_visualization, **kwargs)
         else:
-            result_list = self._parse_selfhosted(images, save_layout_visualization)
+            result_list = self._parse_selfhosted(
+                images,
+                save_layout_visualization,
+                preserve_order=preserve_order,
+            )
 
         return result_list[0] if _single else result_list
 
     def _parse_stream(
         self,
-        images: List[str],
+        images: List[Union[str, bytes, Path]],
         save_layout_visualization: bool = True,
+        preserve_order: bool = True,
         **kwargs: Any,
     ) -> Generator[PipelineResult, None, None]:
         """Internal: yield one PipelineResult per input. Used by parse(stream=True)."""
@@ -251,19 +295,17 @@ class GlmOcr:
             if save_layout_visualization:
                 kwargs.setdefault("need_layout_visualization", True)
             for image in images:
-                img = image
-                if img.startswith("file://"):
-                    img = img[7:]
+                source, display = self._maas_source(image)
                 try:
-                    response = self._maas_client.parse(img, **kwargs)
-                    result = self._maas_response_to_pipeline_result(response, img)
+                    response = self._maas_client.parse(source, **kwargs)
+                    result = self._maas_response_to_pipeline_result(response, display)
                     yield result
                 except Exception as e:
-                    logger.error("MaaS API error for %s: %s", img, e)
+                    logger.error("MaaS API error for %s: %s", display, e)
                     result = PipelineResult(
                         json_result=[],
                         markdown_result="",
-                        original_images=[img],
+                        original_images=[display],
                     )
                     result._error = str(e)
                     yield result
@@ -271,38 +313,34 @@ class GlmOcr:
         for result in self._stream_parse_selfhosted(
             images,
             save_layout_visualization=save_layout_visualization,
+            preserve_order=preserve_order,
         ):
             yield result
 
     def _parse_maas(
         self,
-        images: List[str],
+        images: List[Union[str, bytes, Path]],
         save_layout_visualization: bool = True,
-        **kwargs,
+        **kwargs: Any,
     ) -> List[PipelineResult]:
         """Parse using MaaS API (passthrough mode)."""
         results = []
 
-        # Map save_layout_visualization to MaaS API parameter
         if save_layout_visualization:
             kwargs.setdefault("need_layout_visualization", True)
 
         for image in images:
-            # Resolve file:// URLs to actual paths
-            if image.startswith("file://"):
-                image = image[7:]
-
+            source, display = self._maas_source(image)
             try:
-                response = self._maas_client.parse(image, **kwargs)
-                result = self._maas_response_to_pipeline_result(response, image)
+                response = self._maas_client.parse(source, **kwargs)
+                result = self._maas_response_to_pipeline_result(response, display)
                 results.append(result)
             except Exception as e:
-                logger.error("MaaS API error for %s: %s", image, e)
-                # Return an error result
+                logger.error("MaaS API error for %s: %s", display, e)
                 result = PipelineResult(
                     json_result=[],
                     markdown_result="",
-                    original_images=[image],
+                    original_images=[display],
                 )
                 result._error = str(e)
                 results.append(result)
@@ -314,8 +352,8 @@ class GlmOcr:
     # ------------------------------------------------------------------
     # The MaaS API returns bbox_2d in **absolute pixel coordinates** of
     # its own internal rendering (e.g. 2040×2640 for a letter-sized PDF
-    # page).  The rest of the SDK (self-hosted pipeline, crop_image_region,
-    # crop_and_replace_images) uses **normalised 0-1000 coordinates**.
+    # page).  The rest of the SDK (self-hosted pipeline,
+    # resolve_image_regions) uses **normalised 0-1000 coordinates**.
     #
     # To keep everything consistent we convert here, right after receiving
     # the MaaS response, so that json_result and markdown_result always
@@ -348,8 +386,8 @@ class GlmOcr:
         pages_info: List[Dict[str, int]],
     ) -> str:
         """Replace absolute-pixel bbox values in Markdown image refs with
-        normalised 0-1000 values so that ``crop_and_replace_images`` crops
-        from the correct region.
+        normalised 0-1000 values so that the result formatter resolves
+        the correct region.
         """
         if not pages_info or not markdown:
             return markdown
@@ -416,11 +454,18 @@ class GlmOcr:
             pages_info,
         )
 
+        json_result, markdown_result, image_files = resolve_image_regions(
+            json_result,
+            markdown_result,
+            source,
+        )
+
         # Create PipelineResult
         result = PipelineResult(
             json_result=json_result,
             markdown_result=markdown_result,
             original_images=[source],
+            image_files=image_files or None,
         )
 
         # Store additional MaaS response data
@@ -431,69 +476,51 @@ class GlmOcr:
 
         return result
 
+    def _build_selfhosted_request(
+        self,
+        images: List[Union[str, bytes, Path]],
+    ) -> Dict[str, Any]:
+        """Build request from mixed inputs (paths, URLs, or raw bytes)."""
+        messages: List[Dict[str, Any]] = [{"role": "user", "content": []}]
+        for image in images:
+            if isinstance(image, bytes):
+                messages[0]["content"].append({"type": "image_bytes", "data": image})
+            else:
+                url = self._to_url(image)
+                messages[0]["content"].append(
+                    {"type": "image_url", "image_url": {"url": url}}
+                )
+        return {"messages": messages}
+
     def _parse_selfhosted(
         self,
-        images: List[str],
+        images: List[Union[str, bytes, Path]],
         save_layout_visualization: bool = True,
+        preserve_order: bool = True,
     ) -> List[PipelineResult]:
         """Parse using self-hosted vLLM/SGLang pipeline."""
-        import tempfile
-
-        messages = [{"role": "user", "content": []}]
-        for image in images:
-            if image.startswith(("http://", "https://", "data:", "file://")):
-                url = image
-            else:
-                url = f"file://{Path(image).absolute()}"
-            messages[0]["content"].append(
-                {"type": "image_url", "image_url": {"url": url}}
-            )
-        request_data = {"messages": messages}
-
-        layout_vis_dir = None
-        if self._pipeline.enable_layout and save_layout_visualization:
-            layout_vis_dir = tempfile.mkdtemp(prefix="layout_vis_")
-
+        request_data = self._build_selfhosted_request(images)
         results = list(
             self._pipeline.process(
                 request_data,
                 save_layout_visualization=save_layout_visualization,
-                layout_vis_output_dir=layout_vis_dir,
+                preserve_order=preserve_order,
             )
         )
         return results
 
     def _stream_parse_selfhosted(
         self,
-        images: List[str],
+        images: List[Union[str, bytes, Path]],
         save_layout_visualization: bool = True,
+        preserve_order: bool = True,
     ) -> Generator[PipelineResult, None, None]:
-        """Streaming variant of self-hosted parse().
-
-        Wraps ``Pipeline.process(...)`` and yields results as soon as they
-        become available from the async pipeline.
-        """
-        import tempfile
-
-        messages = [{"role": "user", "content": []}]
-        for image in images:
-            if image.startswith(("http://", "https://", "data:", "file://")):
-                url = image
-            else:
-                url = f"file://{Path(image).absolute()}"
-            messages[0]["content"].append(
-                {"type": "image_url", "image_url": {"url": url}}
-            )
-        request_data = {"messages": messages}
-
-        layout_vis_dir = None
-        if self._pipeline.enable_layout and save_layout_visualization:
-            layout_vis_dir = tempfile.mkdtemp(prefix="layout_vis_")
-
+        """Streaming variant of self-hosted parse()."""
+        request_data = self._build_selfhosted_request(images)
         for result in self._pipeline.process(
             request_data,
             save_layout_visualization=save_layout_visualization,
-            layout_vis_output_dir=layout_vis_dir,
+            preserve_order=preserve_order,
         ):
             yield result
 
@@ -541,6 +568,12 @@ class GlmOcr:
             **kwargs,
         )
 
+    def get_queue_stats(self) -> Optional[Dict[str, int]]:
+        """Return current pipeline queue sizes, or ``None`` if unavailable."""
+        if self._pipeline is not None:
+            return self._pipeline.get_queue_stats()
+        return None
+
     def close(self):
         """Close the parser and release resources."""
         if self._pipeline:
@@ -569,7 +602,7 @@ class GlmOcr:
 # Convenience function
 @overload
 def parse(
-    images: str,
+    images: Union[str, bytes, Path],
     config_path: Optional[str] = ...,
     save_layout_visualization: bool = ...,
 ) -> PipelineResult: ...
@@ -577,7 +610,7 @@ def parse(
 
 @overload
 def parse(
-    images: List[str],
+    images: List[Union[str, bytes, Path]],
     config_path: Optional[str] = ...,
     save_layout_visualization: bool = ...,
 ) -> List[PipelineResult]: ...
@@ -585,7 +618,7 @@ def parse(
 
 @overload
 def parse(
-    images: Union[str, List[str]],
+    images: Union[str, bytes, Path, List[Union[str, bytes, Path]]],
     config_path: Optional[str] = ...,
     save_layout_visualization: bool = ...,
     *,
@@ -595,17 +628,17 @@ def parse(
 
 
 def parse(
-    images: Union[str, List[str]],
+    images: Union[str, bytes, Path, List[Union[str, bytes, Path]]],
     config_path: Optional[str] = None,
     save_layout_visualization: bool = True,
     *,
     stream: bool = False,
+    preserve_order: bool = True,
     api_key: Optional[str] = None,
     api_url: Optional[str] = None,
     model: Optional[str] = None,
     mode: Optional[str] = None,
     timeout: Optional[int] = None,
-    enable_layout: Optional[bool] = None,
     log_level: Optional[str] = None,
     env_file: Optional[str] = None,
     **kwargs: Any,
@@ -613,7 +646,6 @@ def parse(
     """Convenience function: parse images or documents in one call.
 
     Creates a :class:`GlmOcr` instance, runs parsing, and cleans up.
-    All keyword arguments are forwarded to the ``GlmOcr`` constructor.
 
     Examples::
 
@@ -628,41 +660,22 @@ def parse(
         # Self-hosted mode
         results = glmocr.parse("image.png", mode="selfhosted")
 
-        # Stream to avoid large in-memory results
         for r in glmocr.parse(["a.pdf", "b.pdf"], stream=True):
             r.save(output_dir="./output")
 
-    The return type mirrors the input type and stream:
-    - ``str``, stream=False → ``PipelineResult``
-    - ``List[str]``, stream=False → ``List[PipelineResult]``
-    - ``stream=True`` → ``Generator[PipelineResult, None, None]``
-
     Args:
-        images: Image path or URL (single ``str`` or ``List[str]``).
+        images: Single input or list.  Each element can be ``str`` (path/URL),
+            ``bytes`` (raw image/PDF), or ``pathlib.Path``.
         config_path: Config file path.
         save_layout_visualization: Whether to save layout visualization.
-        stream: If ``True``, returns a generator that yields one result at a time.
+        stream: If ``True``, returns a generator.
+        preserve_order: Whether to keep output order consistent with input order.
         api_key:  API key.
         api_url:  MaaS API endpoint URL.
         model:    Model name.
         mode:     ``"maas"`` or ``"selfhosted"``.
         timeout:  Request timeout in seconds.
-        enable_layout: Whether to run layout detection.
         log_level: Logging level.
-
-    Returns:
-        A single ``PipelineResult``, a list, or a generator, depending on input and stream.
-
-    Example:
-        result = parse("image.png")
-        result.save(output_dir="./output")
-
-        results = parse(["img1.png", "doc.pdf"])
-        for r in results:
-            r.save(output_dir="./output")
-
-        for r in parse(["a.pdf", "b.pdf"], stream=True):
-            r.save(output_dir="./output")
     """
     with GlmOcr(
         config_path=config_path,
@@ -671,7 +684,6 @@ def parse(
         model=model,
         mode=mode,
         timeout=timeout,
-        enable_layout=enable_layout,
         log_level=log_level,
         env_file=env_file,
     ) as parser:
@@ -679,5 +691,6 @@ def parse(
             images,
             stream=stream,
             save_layout_visualization=save_layout_visualization,
+            preserve_order=preserve_order,
             **kwargs,
         )

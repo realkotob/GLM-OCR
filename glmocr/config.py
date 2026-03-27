@@ -44,8 +44,6 @@ _ENV_MAP: Dict[str, str] = {
     "OCR_API_HOST": "pipeline.ocr_api.api_host",
     "OCR_API_PORT": "pipeline.ocr_api.api_port",
     "OCR_MODEL": "pipeline.ocr_api.model",
-    # Layout
-    "ENABLE_LAYOUT": "pipeline.enable_layout",
     # Allow overriding which GPU(s) the layout model uses
     "LAYOUT_CUDA_VISIBLE_DEVICES": "pipeline.layout.cuda_visible_devices",
     # Explicit device for layout model: "cpu", "cuda", "cuda:0", etc.
@@ -81,10 +79,9 @@ class OCRApiConfig(_BaseConfig):
     api_scheme: Optional[str] = None
     api_path: str = "/v1/chat/completions"
     api_url: Optional[str] = None
-    model: Optional[str] = None  # Optional model name (required by Ollama/MLX)
     api_key: Optional[str] = None
 
-    # Model name included in API requests.
+    # Model name included in API requests (required by Ollama/MLX).
     model: Optional[str] = None
     headers: Dict[str, str] = Field(default_factory=dict)
     verify_ssl: bool = False
@@ -93,8 +90,8 @@ class OCRApiConfig(_BaseConfig):
     # Use "ollama_generate" for Ollama's native /api/generate endpoint
     api_mode: str = "openai"
 
-    connect_timeout: int = 300
-    request_timeout: int = 300
+    connect_timeout: int = 30
+    request_timeout: int = 120
 
     # Retry behavior (for transient upstream failures like 429/5xx)
     retry_max_attempts: int = 2  # total attempts = 1 + retry_max_attempts
@@ -151,8 +148,8 @@ class MaaSApiConfig(_BaseConfig):
 
 
 class PageLoaderConfig(_BaseConfig):
-    max_tokens: int = 16384
-    temperature: float = 0.01
+    max_tokens: int = 8192
+    temperature: float = 0.0
     top_p: float = 0.00001
     top_k: int = 1
     repetition_penalty: float = 1.1
@@ -164,11 +161,6 @@ class PageLoaderConfig(_BaseConfig):
     min_pixels: int = 112 * 112
     max_pixels: int = 14 * 14 * 4 * 1280
 
-    default_prompt: str = (
-        "Recognize the text in the image and output in Markdown format. "
-        "Preserve the original layout (headings/paragraphs/tables/formulas). "
-        "Do not fabricate content that does not exist in the image."
-    )
     task_prompt_mapping: Optional[Dict[str, str]] = None
 
     pdf_dpi: int = 200
@@ -180,12 +172,15 @@ class ResultFormatterConfig(_BaseConfig):
     filter_nested: bool = True
     min_overlap_ratio: float = 0.8
     output_format: str = "both"  # json | markdown | both
+    enable_merge_formula_numbers: bool = True
+    enable_merge_text_blocks: bool = True
+    enable_format_bullet_points: bool = True
     label_visualization_mapping: Dict[str, Any] = Field(default_factory=dict)
 
 
 class LayoutConfig(_BaseConfig):
     model_dir: Optional[str] = None
-    threshold: float = 0.4
+    threshold: float = 0.3
     threshold_by_class: Optional[Dict[Union[int, str], float]] = None
     batch_size: int = 8
     workers: int = 1
@@ -202,6 +197,7 @@ class LayoutConfig(_BaseConfig):
     layout_unclip_ratio: Optional[Any] = None
     layout_merge_bboxes_mode: Union[str, Dict[int, str]] = "large"
     label_task_mapping: Optional[Dict[str, Any]] = None
+    use_polygon: bool = False
 
     @field_validator("device")
     @classmethod
@@ -218,7 +214,6 @@ class LayoutConfig(_BaseConfig):
             return value
         v = value.strip()
         if v == "":
-            # Treat empty string as "unset" for convenience.
             return None
         if v == "cpu" or v == "cuda":
             return v
@@ -233,8 +228,6 @@ class LayoutConfig(_BaseConfig):
 
 
 class PipelineConfig(_BaseConfig):
-    enable_layout: bool = False
-
     # MaaS mode configuration (Zhipu cloud API passthrough)
     maas: MaaSApiConfig = Field(default_factory=MaaSApiConfig)
 
@@ -265,11 +258,8 @@ def _set_nested(data: Dict[str, Any], dotted_path: str, value: Any) -> None:
 def _coerce_env_value(dotted_path: str, raw: str) -> Any:
     """Coerce a raw environment-variable string to the expected Python type."""
     # Boolean fields
-    if dotted_path in ("pipeline.maas.enabled", "pipeline.enable_layout"):
-        # Special handling for MODE: "maas" → True, anything else → False
-        if dotted_path == "pipeline.maas.enabled":
-            return raw.strip().lower() in ("maas", "true", "1", "yes")
-        return raw.strip().lower() in ("true", "1", "yes")
+    if dotted_path == "pipeline.maas.enabled":
+        return raw.strip().lower() in ("maas", "true", "1", "yes")
     # Integer fields
     if dotted_path.endswith((".api_port", ".request_timeout", ".connect_timeout")):
         return int(raw)
@@ -372,7 +362,13 @@ class GlmOcrConfig(_BaseConfig):
         config_path: Optional[Union[str, Path]] = None,
         **overrides: Any,
     ) -> "GlmOcrConfig":
-        """Build config with priority: *overrides* > env-vars > YAML > defaults.
+        """Build config with layered priority (highest → lowest):
+
+        1. CLI ``--set`` overrides (``_dotted`` dict)
+        2. Keyword overrides (``api_key``, ``mode``, …)
+        3. ``GLMOCR_*`` environment variables / ``.env`` file
+        4. YAML config file
+        5. Built-in defaults
 
         This is the **agent-friendly** entry-point.  An agent (or any
         programmatic caller) can configure the SDK entirely through keyword
@@ -388,7 +384,6 @@ class GlmOcrConfig(_BaseConfig):
         * ``model``          – model name
         * ``mode``           – ``"maas"`` or ``"selfhosted"``
         * ``timeout``        – request timeout in seconds
-        * ``enable_layout``  – whether to run layout detection
         * ``log_level``      – logging level (DEBUG / INFO / …)
         * ``env_file``       – explicit path to a ``.env`` file
 
@@ -408,7 +403,8 @@ class GlmOcrConfig(_BaseConfig):
             # With a custom YAML base
             cfg = GlmOcrConfig.from_env(config_path="my.yaml", api_key="sk")
         """
-        # 1. YAML baseline
+        # --- Priority (applied in order, later wins): ---
+        # 1. YAML baseline (lowest)
         yaml_path = Path(config_path or cls.default_path())
         if yaml_path.exists():
             data: Dict[str, Any] = (
@@ -420,19 +416,18 @@ class GlmOcrConfig(_BaseConfig):
                 raise FileNotFoundError(f"Config file not found: {yaml_path}")
             data = {}
 
-        # 2. Environment variable overrides
+        # 2. Environment variable overrides (.env + GLMOCR_*)
         env_file = overrides.pop("env_file", None)
         env_data = _collect_env_overrides(env_file=env_file)
         if env_data:
             _deep_merge(data, env_data)
 
-        # 3. Keyword overrides (flat convenience names → nested paths)
+        # 3. Keyword overrides (Python API convenience names)
         _KW_MAP = {
             "api_key": "pipeline.maas.api_key",
             "api_url": "pipeline.maas.api_url",
             "mode": "pipeline.maas.enabled",
             "timeout": "pipeline.maas.request_timeout",
-            "enable_layout": "pipeline.enable_layout",
             "log_level": "logging.level",
             # Self-hosted OCR API
             "ocr_api_host": "pipeline.ocr_api.api_host",
@@ -455,6 +450,10 @@ class GlmOcrConfig(_BaseConfig):
                 raw = overrides[kw]
                 _set_nested(data, dotted, _coerce_env_value(dotted, str(raw)))
 
+        # 4. CLI --set overrides (highest priority)
+        for dotted, value in overrides.get("_dotted", {}).items():
+            _set_nested(data, dotted, value)
+
         return cls.model_validate(data)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -465,11 +464,12 @@ def load_config(
     path: Optional[Union[str, Path]] = None,
     **overrides: Any,
 ) -> GlmOcrConfig:
-    """Load config with priority: *overrides* > env-vars > YAML > defaults.
+    """Load config with priority: CLI --set > keyword > env-vars > YAML > defaults.
 
     This is a drop-in replacement for the old ``load_config(path)``.
     When called without arguments it behaves exactly as before (YAML only).
     When keyword overrides or ``GLMOCR_*`` env-vars are present they take
-    precedence.
+    precedence.  CLI ``--set`` overrides (passed via ``_dotted``) have the
+    highest priority.
     """
     return GlmOcrConfig.from_env(config_path=path, **overrides)

@@ -105,7 +105,6 @@ def create_app(config: "GlmOcrConfig") -> Flask:
                 pipeline.process(
                     request_data,
                     save_layout_visualization=False,
-                    layout_vis_output_dir=None,
                 )
             )
             if not results:

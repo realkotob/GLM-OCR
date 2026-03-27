@@ -101,23 +101,23 @@ pipeline:
     retry_status_codes: [429, 500, 502, 503, 504]
 
     # HTTP connection pool size (default 128). Set >= max_workers to avoid
-    # "Connection pool is full" when layout mode runs concurrent requests.
+    # "Connection pool is full" when runs concurrent requests.
     connection_pool_size: 128
 
-  # Maximum parallel workers for region recognition (layout mode)
+  # Maximum parallel workers for region recognition
   # Lower values to reduce 503 errors on busy OCR servers
   max_workers: 32
   # Queue sizes
   page_maxsize: 100
-  region_maxsize: 800
+  region_maxsize: 2000
 
   # Page loader: handles image/PDF loading and API request building
   page_loader:
     # Generation parameters
-    max_tokens: 4096
-    temperature: 0.8
-    top_p: 0.9
-    top_k: 50
+    max_tokens: 8192
+    temperature: 0.0
+    top_p: 0.00001
+    top_k: 1
     repetition_penalty: 1.1
 
     # Image processing
@@ -128,31 +128,25 @@ pipeline:
     min_pixels: 12544 # 112 * 112
     max_pixels: 71372800 # 14 * 14 * 4 * 1280
 
-    # Default prompt for OCR (used when no custom prompt provided)
-    default_prompt: >
-      Recognize the text in the image and output in Markdown format.
-      Preserve the original layout (headings/paragraphs/tables/formulas).
-      Do not fabricate content that does not exist in the image.
-
-    # Task-specific prompts (used in layout mode)
+    # Task-specific prompts
     task_prompt_mapping:
       text: "Text Recognition:"
       table: "Table Recognition:"
       formula: "Formula Recognition:"
 
-    # PDF processing (pypdfium2 only)
+    # PDF processing
     pdf_dpi: 200
     pdf_max_pages: null # null = no limit
     pdf_verbose: false
 
   # Result formatter: post-processing and output formatting
   result_formatter:
-    # Filter nested regions (remove overlapping smaller regions)
-    filter_nested: true
-    min_overlap_ratio: 0.8
-
     # Output format: json, markdown, or both
     output_format: both
+    # Post-process switches
+    enable_merge_formula_numbers: true
+    enable_merge_text_blocks: true
+    enable_format_bullet_points: true
 
     # Label to visualization category mapping (for layout visualization)
     label_visualization_mapping:
@@ -178,17 +172,12 @@ pipeline:
         - seal
         - formula_number
 
-  # Enable layout detection mode
-  # - true: detect document regions (tables, figures, text blocks) then OCR each
-  # - false: direct OCR on the whole image
-  enable_layout: true
-
-  # Layout detection settings (used when enable_layout=true)
+  # Layout detection settings
   layout:
     # PP-DocLayoutV3 model directory
     # Can be a local folder or a Hugging Face model id
     # (Use *_safetensors for Transformers; PaddlePaddle/PP-DocLayoutV3 is a PaddleOCR export)
-    model_dir: PaddlePaddle/PP-DocLayoutV3_safetensors
+    model_dir: /workspace/ocr_document_data_cloud/ckpt/opensource/PP-DocLayoutV3_safetensors
 
     # Detection threshold
     threshold: 0.3
@@ -212,6 +201,14 @@ pipeline:
     # Can also be set via GLMOCR_LAYOUT_DEVICE env var or --layout-device CLI flag.
     # device: null
     # img_size: null                # resize input (optional)
+
+    # Use polygon masks for region cropping and visualization.
+    # When true, regions are cropped using the polygon outline from layout
+    # detection (more precise, masks out content outside the polygon),
+    # recommended for documents with rotating or staggered layouts.
+    # When false, regions are cropped using the bounding box only (faster, simpler),
+    # recommended for regular documents without rotating.
+    use_polygon: false
 
     # Post-processing
     layout_nms: true

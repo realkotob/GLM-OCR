@@ -113,3 +113,42 @@ def clean_formula_number(number_content: str) -> str:
     elif number_clean.startswith("（") and number_clean.endswith("）"):
         number_clean = number_clean[1:-1]
     return number_clean
+
+
+def normalize_inline_formula(content: str) -> str:
+    """Normalize inline formula spacing.
+
+    ``$ x $`` → ``$x$``, and ensure a space between surrounding text
+    and the ``$...$`` delimiter.
+    """
+    INLINE_FORMULA_RE = re.compile(r"(?<!\$)\$\s*((?:[^$\\]|\\.)+?)\s*\$(?!\$)")
+    if "$" not in content:
+        return content
+
+    parts: list = []
+    last_end = 0
+
+    for m in INLINE_FORMULA_RE.finditer(content):
+        formula = m.group(1).strip()
+        if not formula:
+            continue
+
+        start, end = m.start(), m.end()
+        before = content[last_end:start]
+
+        if before and before[-1].isalnum():
+            before += " "
+
+        parts.append(before)
+        parts.append(f"${formula}$")
+
+        if end < len(content) and content[end].isalnum():
+            parts.append(" ")
+
+        last_end = end
+
+    if not parts:
+        return content
+
+    parts.append(content[last_end:])
+    return "".join(parts)

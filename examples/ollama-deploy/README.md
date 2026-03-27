@@ -61,8 +61,6 @@ pipeline:
     api_path: /api/generate  # Use Ollama native endpoint
     model: glm-ocr:latest    # Required: specify model name
     api_mode: ollama_generate  # Required: use Ollama native format
-  
-  enable_layout: false  # Recommended for initial testing
 ```
 
 ### Configuration Options Explained
@@ -70,7 +68,6 @@ pipeline:
 - **api_path**: `/api/generate` - Ollama's native endpoint (more stable for vision)
 - **model**: `glm-ocr:latest` - Model name (required by Ollama)
 - **api_mode**: `ollama_generate` - Enables Ollama-specific request/response format
-- **enable_layout**: `false` - Disable layout detection if dependencies not installed
 
 ## Usage
 

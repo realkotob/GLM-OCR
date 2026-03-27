@@ -70,7 +70,6 @@ or in a `.env` file anywhere in the working-directory ancestry.
 | `GLMOCR_OCR_API_HOST`  | `pipeline.ocr_api.api_host`     | `localhost`                         |
 | `GLMOCR_OCR_API_PORT`  | `pipeline.ocr_api.api_port`     | `5002`                              |
 | `GLMOCR_OCR_MODEL`     | `pipeline.ocr_api.model`        | `glm-ocr-model`                     |
-| `GLMOCR_ENABLE_LAYOUT` | `pipeline.enable_layout`        | `true` / `false`                    |
 | `GLMOCR_LOG_LEVEL`     | `logging.level`                 | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
 ### `.env` File Auto-Loading
@@ -102,7 +101,6 @@ with **higher priority**.
 | `model`         | `str`  | Model name.                                               |
 | `mode`          | `str`  | `"maas"` or `"selfhosted"`.                               |
 | `timeout`       | `int`  | Request timeout in seconds.                               |
-| `enable_layout` | `bool` | Enable layout detection.                                  |
 | `log_level`     | `str`  | Logging level.                                            |
 
 ---

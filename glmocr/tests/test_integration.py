@@ -123,15 +123,6 @@ class TestParseEndpoint:
         if sample_pdf_path is None:
             pytest.skip("No sample PDF available")
 
-        # Dependency check: pypdfium2
-        try:
-            from glmocr.utils.image_utils import PYPDFIUM2_AVAILABLE
-        except Exception:
-            PYPDFIUM2_AVAILABLE = False
-
-        if not PYPDFIUM2_AVAILABLE:
-            pytest.skip("pypdfium2 is not installed")
-
         pdf_uri = f"file://{sample_pdf_path.resolve()}"
         payload = {"images": [pdf_uri]}
         resp = requests.post(

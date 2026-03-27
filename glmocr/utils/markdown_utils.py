@@ -1,142 +1,112 @@
-"""Markdown processing utilities."""
+"""Markdown processing utilities for image region resolution."""
 
-import re
-import ast
+from __future__ import annotations
+
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from PIL import Image
-from glmocr.utils.image_utils import (
-    crop_image_region,
-    pdf_to_images_pil,
-    PYPDFIUM2_AVAILABLE,
-)
+from glmocr.utils.image_utils import crop_image_region, pdf_to_images_pil
 from glmocr.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-def extract_image_refs(markdown_text: str) -> List[Tuple[int, List[int], str]]:
-    """Extract image references from Markdown.
+def resolve_image_regions(
+    json_result: list,
+    markdown_result: str,
+    source: str,
+    image_prefix: str = "cropped",
+) -> Tuple[list, str, Dict[str, Any]]:
+    """Crop image regions from the original file, resolve markdown and JSON paths.
+
+    For results where image regions only have bbox references (e.g. MaaS),
+    this function loads the original file, crops each image region, and
+    produces the ``image_files`` dict that ``PipelineResult.save()`` persists
+    to disk.
 
     Args:
-        markdown_text: Markdown text.
-
-    Returns:
-        List of (page_idx, bbox, original_tag).
-    """
-    # Pattern: ![](page=0,bbox=[57, 199, 884, 444])
-    pattern = r"!\[\]\(page=(\d+),bbox=(\[[\d,\s]+\])\)"
-    matches = re.finditer(pattern, markdown_text)
-
-    image_refs = []
-    for match in matches:
-        page_idx = int(match.group(1))
-        bbox_str = match.group(2)
-        # Parse bbox string safely
-        try:
-            bbox = ast.literal_eval(bbox_str)
-            if not isinstance(bbox, list) or len(bbox) != 4:
-                raise ValueError(f"Invalid bbox format: {bbox_str}")
-        except (ValueError, SyntaxError) as e:
-            logger.warning("Cannot parse bbox %s: %s", bbox_str, e)
-            continue
-        original_tag = match.group(0)
-        image_refs.append((page_idx, bbox, original_tag))
-
-    return image_refs
-
-
-def crop_and_replace_images(
-    markdown_text: str,
-    original_images: List[str],
-    output_dir: Path,
-    image_prefix: str = "image",
-) -> Tuple[str, List[str]]:
-    """Crop referenced image regions and replace Markdown tags.
-
-    Args:
-        markdown_text: Source Markdown.
-        original_images: Original image paths.
-        output_dir: Output directory.
+        json_result: List-of-pages recognition results (list of lists of
+            region dicts).
+        markdown_result: Markdown text potentially containing
+            ``![](page=N,bbox=[...])`` placeholders.
+        source: Path to the original image or PDF file.
         image_prefix: Filename prefix for cropped images.
 
     Returns:
-        (updated_markdown, saved_image_paths)
+        (updated_json_result, updated_markdown_result, image_files)
     """
-    # Ensure output directory exists
-    output_dir.mkdir(parents=True, exist_ok=True)
+    has_images = any(
+        r.get("label") == "image"
+        for page in json_result
+        if isinstance(page, list)
+        for r in page
+        if isinstance(r, dict)
+    )
+    if not has_images:
+        return json_result, markdown_result, {}
 
-    # Extract image references
-    image_refs = extract_image_refs(markdown_text)
-
-    if not image_refs:
-        # No image references
-        return markdown_text, []
-
-    # Load originals (supports PDFs)
-    loaded_images = []
-    for img_path in original_images:
-        path = Path(img_path)
-        suffix = path.suffix.lower()
-
-        if suffix == ".pdf":
-            # PDF: convert to images (pypdfium2 only)
-            if not PYPDFIUM2_AVAILABLE:
-                raise RuntimeError(
-                    "PDF support requires pypdfium2. Install: pip install pypdfium2"
-                )
-            try:
-                pdf_images = pdf_to_images_pil(
-                    img_path, dpi=200, max_width_or_height=3500
-                )
-                loaded_images.extend(pdf_images)
-            except Exception as e:
-                raise RuntimeError(f"Failed to convert PDF to images: {e}") from e
-        else:
-            # Normal image file
-            img = Image.open(img_path)
+    path = Path(source)
+    loaded_images: list = []
+    try:
+        if path.suffix.lower() == ".pdf" and path.is_file():
+            loaded_images = pdf_to_images_pil(
+                str(path),
+                dpi=200,
+                max_width_or_height=3500,
+            )
+        elif path.is_file():
+            img = Image.open(str(path))
             if img.mode != "RGB":
                 img = img.convert("RGB")
             loaded_images.append(img)
+    except Exception as e:
+        logger.warning("Cannot load source %s for image cropping: %s", source, e)
+        return json_result, markdown_result, {}
 
-    # Process each reference
-    result_markdown = markdown_text
-    saved_image_paths = []
+    if not loaded_images:
+        return json_result, markdown_result, {}
 
-    for idx, (page_idx, bbox, original_tag) in enumerate(image_refs):
-        # Validate page index
-        if page_idx < 0 or page_idx >= len(loaded_images):
-            logger.warning(
-                "page_idx %d out of range (total %d images), skipping",
-                page_idx,
-                len(loaded_images),
-            )
+    image_files: Dict[str, Any] = {}
+    image_counter = 0
+    updated_json: List[list] = []
+
+    for page_idx, page in enumerate(json_result):
+        if not isinstance(page, list):
+            updated_json.append(page)
             continue
+        page_copy = []
+        for region in page:
+            if (
+                not isinstance(region, dict)
+                or region.get("label") != "image"
+                or page_idx >= len(loaded_images)
+            ):
+                page_copy.append(region)
+                continue
 
-        # Crop from original
-        original_image = loaded_images[page_idx]
-        try:
-            cropped_image = crop_image_region(original_image, bbox)
+            bbox = region.get("bbox_2d")
+            region_copy = dict(region)
+            if bbox:
+                try:
+                    cropped = crop_image_region(loaded_images[page_idx], bbox)
+                    filename = f"{image_prefix}_page{page_idx}_idx{image_counter}.jpg"
+                    rel_path = f"imgs/{filename}"
+                    image_files[filename] = cropped
+                    region_copy["image_path"] = rel_path
 
-            # Output filename format: image_page0_idx0.jpg
-            image_filename = f"{image_prefix}_page{page_idx}_idx{idx}.jpg"
-            image_path = output_dir / image_filename
+                    old_tag = f"![](page={page_idx},bbox={bbox})"
+                    new_tag = f"![Image {page_idx}-{image_counter}]({rel_path})"
+                    markdown_result = markdown_result.replace(old_tag, new_tag, 1)
+                    image_counter += 1
+                except Exception as e:
+                    logger.warning(
+                        "Failed to crop image (page=%d, bbox=%s): %s",
+                        page_idx,
+                        bbox,
+                        e,
+                    )
+            page_copy.append(region_copy)
+        updated_json.append(page_copy)
 
-            # Save cropped image
-            cropped_image.save(image_path, quality=95)
-            saved_image_paths.append(str(image_path))
-
-            # Replace Markdown image tag with a relative path (imgs/filename)
-            relative_path = f"imgs/{image_filename}"
-            new_tag = f"![Image {page_idx}-{idx}]({relative_path})"
-            result_markdown = result_markdown.replace(original_tag, new_tag, 1)
-
-        except Exception as e:
-            logger.warning(
-                "Failed to crop image (page=%d, bbox=%s): %s", page_idx, bbox, e
-            )
-            # Keep original tag on failure
-            continue
-
-    return result_markdown, saved_image_paths
+    return updated_json, markdown_result, image_files

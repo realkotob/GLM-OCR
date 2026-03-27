@@ -234,25 +234,10 @@ class TestPageLoader:
         assert loader.max_tokens == 8192
         assert loader.image_format == "PNG"
 
-    def test_pageloader_load_pdf_requires_pypdfium2(self):
-        """Gives a clear error when pypdfium2 is unavailable."""
-        from glmocr.dataloader import PageLoader
-        from glmocr.config import PageLoaderConfig
-
-        loader = PageLoader(PageLoaderConfig())
-        with patch("glmocr.dataloader.page_loader.PYPDFIUM2_AVAILABLE", False):
-            with pytest.raises(RuntimeError) as exc:
-                loader._load_pdf("dummy.pdf")
-            assert "pypdfium2" in str(exc.value).lower()
-
     def test_pageloader_load_pdf_pages(self):
-        """Expands a PDF into page images (requires pypdfium2)."""
+        """Expands a PDF into page images."""
         from glmocr.config import PageLoaderConfig
         from glmocr.dataloader import PageLoader
-        from glmocr.utils.image_utils import PYPDFIUM2_AVAILABLE
-
-        if not PYPDFIUM2_AVAILABLE:
-            pytest.skip("pypdfium2 is not installed")
 
         repo_root = Path(__file__).resolve().parents[2]
         source_dir = repo_root / "examples" / "source"
@@ -271,11 +256,7 @@ class TestPageLoader:
     def test_pageloader_load_pdf_via_file_uri(self):
         """Parses PDF file:// URIs correctly."""
         from glmocr.dataloader import PageLoader
-        from glmocr.utils.image_utils import PYPDFIUM2_AVAILABLE
         from glmocr.config import PageLoaderConfig
-
-        if not PYPDFIUM2_AVAILABLE:
-            pytest.skip("pypdfium2 is not installed")
 
         repo_root = Path(__file__).resolve().parents[2]
         source_dir = repo_root / "examples" / "source"
@@ -295,10 +276,6 @@ class TestPageLoader:
         """Streaming: pages yielded incrementally; unit indices correct for multi-source."""
         from glmocr.config import PageLoaderConfig
         from glmocr.dataloader import PageLoader
-        from glmocr.utils.image_utils import PYPDFIUM2_AVAILABLE
-
-        if not PYPDFIUM2_AVAILABLE:
-            pytest.skip("pypdfium2 is not installed")
 
         repo_root = Path(__file__).resolve().parents[2]
         source_dir = repo_root / "examples" / "source"
@@ -398,31 +375,6 @@ class TestParseResult:
             original_images=["a.png", "b.png"],
         )
         assert "images=2" in repr(result)
-
-
-class TestPipeline:
-    """Tests for Pipeline (without starting)."""
-
-    def test_pipeline_init_enable_layout_default(self):
-        """Default enable_layout behavior (mocked)."""
-        from glmocr.pipeline import Pipeline
-
-        # Use a mock to avoid heavy dependencies
-        with patch.object(Pipeline, "__init__", lambda self, config: None):
-            p = Pipeline.__new__(Pipeline)
-            p.config = {}
-            p.enable_layout = p.config.get("enable_layout", True)
-            assert p.enable_layout is True
-
-    def test_pipeline_init_enable_layout_false(self):
-        """enable_layout can be disabled (mocked)."""
-        with patch("glmocr.pipeline.Pipeline.__init__", return_value=None):
-            from glmocr.pipeline import Pipeline
-
-            p = Pipeline.__new__(Pipeline)
-            p.config = {"enable_layout": False}
-            p.enable_layout = p.config.get("enable_layout", True)
-            assert p.enable_layout is False
 
 
 class TestUtils:
@@ -746,18 +698,6 @@ class TestCoerceEnvValue:
 
         assert _coerce_env_value("pipeline.maas.enabled", "MaaS") is True
         assert _coerce_env_value("pipeline.maas.enabled", "TRUE") is True
-
-    def test_enable_layout_true(self):
-        from glmocr.config import _coerce_env_value
-
-        assert _coerce_env_value("pipeline.enable_layout", "1") is True
-        assert _coerce_env_value("pipeline.enable_layout", "yes") is True
-
-    def test_enable_layout_false(self):
-        from glmocr.config import _coerce_env_value
-
-        assert _coerce_env_value("pipeline.enable_layout", "0") is False
-        assert _coerce_env_value("pipeline.enable_layout", "no") is False
 
     def test_integer_coercion(self):
         from glmocr.config import _coerce_env_value
@@ -1166,7 +1106,6 @@ class TestParseReturnType:
         obj._pipeline = None
         obj._maas_client = MagicMock()
         obj.config_model = MagicMock()
-        obj.enable_layout = True
 
         # Mock _parse_maas to return a list of one result
         obj._parse_maas = MagicMock(return_value=[mock_result])
@@ -1212,7 +1151,6 @@ class TestGlmOcrParseStream:
         obj._pipeline = None
         obj._maas_client = MagicMock()
         obj.config_model = MagicMock()
-        obj.enable_layout = True
         obj._maas_response_to_pipeline_result = MagicMock(
             return_value=PipelineResult(
                 json_result=[[{"content": "ok"}]],
@@ -1232,7 +1170,6 @@ class TestGlmOcrParseStream:
         obj._maas_client = None
         obj._pipeline = MagicMock()
         obj.config_model = MagicMock()
-        obj.enable_layout = True
         r1 = PipelineResult(
             json_result=[], markdown_result="a", original_images=["a.png"]
         )
@@ -1311,6 +1248,7 @@ class TestGlmOcrParseStream:
         parser._stream_parse_selfhosted.assert_called_once_with(
             ["a.png", "b.png"],
             save_layout_visualization=False,
+            preserve_order=True,
         )
 
 
@@ -1346,7 +1284,6 @@ class TestGlmOcrConstructor:
 
         with patch("glmocr.pipeline.Pipeline") as mock_pipeline:
             mock_pipeline.return_value.start = MagicMock()
-            mock_pipeline.return_value.enable_layout = False
             from glmocr.api import GlmOcr
 
             parser = GlmOcr(mode="selfhosted")

@@ -197,6 +197,10 @@ glmocr parse examples/source/code.png --layout-device cpu
 
 # Run layout detection on a specific GPU
 glmocr parse examples/source/code.png --layout-device cuda:1
+
+# Override any config value via --set (dotted path, repeatable)
+glmocr parse examples/source/code.png --set pipeline.ocr_api.api_port 8080
+glmocr parse examples/source/ --set pipeline.layout.use_polygon true --set logging.level DEBUG
 ```
 
 #### Python API
@@ -256,6 +260,14 @@ Semantics:
 
 ### Configuration
 
+Configuration priority (highest to lowest):
+
+1. CLI `--set` overrides
+2. Python API keyword arguments
+3. `GLMOCR_*` environment variables / `.env` file
+4. YAML config file
+5. Built-in defaults
+
 Full configuration in `glmocr/config.yaml`:
 
 ```yaml
@@ -276,13 +288,13 @@ pipeline:
     api_host: localhost
     api_port: 8080
     api_key: null # or set API_KEY env var
-    connect_timeout: 300
-    request_timeout: 300
+    connect_timeout: 30
+    request_timeout: 120
 
   # Page loader settings
   page_loader:
-    max_tokens: 16384
-    temperature: 0.01
+    max_tokens: 8192
+    temperature: 0.0
     image_format: JPEG
     min_pixels: 12544
     max_pixels: 71372800
@@ -290,9 +302,6 @@ pipeline:
   # Result formatting
   result_formatter:
     output_format: both # json, markdown, or both
-
-  # Layout detection (optional)
-  enable_layout: false
 
   # Layout model device placement
   layout:

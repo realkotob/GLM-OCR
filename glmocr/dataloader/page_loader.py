@@ -26,7 +26,6 @@ from glmocr.utils.image_utils import (
     load_image_to_base64,
     pdf_to_images_pil,
     pdf_to_images_pil_iter,
-    PYPDFIUM2_AVAILABLE,
 )
 from glmocr.utils.logging import get_logger, get_profiler
 
@@ -83,10 +82,7 @@ class PageLoader:
         # Task prompt mapping
         self.task_prompt_mapping = config.task_prompt_mapping
 
-        # Default OCR instruction (used when user provides images without text)
-        self.default_prompt = config.default_prompt
-
-        # PDF-to-image parameters (pypdfium2 only)
+        # PDF-to-image parameters
         self.pdf_dpi = config.pdf_dpi
         self.pdf_max_pages = config.pdf_max_pages
         self.pdf_verbose = config.pdf_verbose
@@ -95,18 +91,21 @@ class PageLoader:
     # Page loading
     # =========================================================================
 
-    def load_pages(self, sources: Union[str, List[str]]) -> List[Image.Image]:
+    def load_pages(
+        self, sources: Union[str, bytes, List[Union[str, bytes]]]
+    ) -> List[Image.Image]:
         """Load sources into a list of PIL Images.
 
-        Supports image files and PDFs (PDFs are expanded into multiple pages).
+        Supports image files, PDFs, and raw bytes (PDFs are expanded into
+        multiple pages).
 
         Args:
-            sources: Single path/URL or a list.
+            sources: Single path/URL/bytes or a list.
 
         Returns:
             List[PIL.Image.Image]
         """
-        if isinstance(sources, str):
+        if isinstance(sources, (str, bytes)):
             sources = [sources]
 
         all_pages = []
@@ -117,21 +116,21 @@ class PageLoader:
         return all_pages
 
     def load_pages_with_unit_indices(
-        self, sources: Union[str, List[str]]
+        self, sources: Union[str, bytes, List[Union[str, bytes]]]
     ) -> Tuple[List[Image.Image], List[int]]:
         """Load sources into pages and return unit index per page.
 
-        Each input URL is one "unit". For a PDF, all its pages share the same
+        Each input is one "unit". For a PDF, all its pages share the same
         unit index. Used by streaming mode to yield one result per input unit.
 
         Args:
-            sources: Single path/URL or a list.
+            sources: Single path/URL/bytes or a list.
 
         Returns:
             (all_pages, unit_indices) where unit_indices[i] is the unit index
-            of page i (i.e. which input URL it came from).
+            of page i (i.e. which input it came from).
         """
-        if isinstance(sources, str):
+        if isinstance(sources, (str, bytes)):
             sources = [sources]
 
         all_pages: List[Image.Image] = []
@@ -142,26 +141,38 @@ class PageLoader:
             unit_indices.extend([unit_idx] * len(pages))
         return all_pages, unit_indices
 
-    def iter_pages_with_unit_indices(self, sources: Union[str, List[str]]):
+    def iter_pages_with_unit_indices(
+        self, sources: Union[str, bytes, List[Union[str, bytes]]]
+    ):
         """Stream pages one at a time with unit index per page.
 
         Yields (page, unit_idx) so the pipeline can enqueue each page as soon
         as it is rendered (e.g. PDF: render one page → yield → next page).
 
         Args:
-            sources: Single path/URL or a list.
+            sources: Single path/URL/bytes or a list.
 
         Yields:
             (PIL.Image, unit_idx) for each page.
         """
-        if isinstance(sources, str):
+        if isinstance(sources, (str, bytes)):
             sources = [sources]
         for unit_idx, source in enumerate(sources):
-            for page in self._iter_source(source):
-                yield page, unit_idx
+            try:
+                for page in self._iter_source(source):
+                    yield page, unit_idx
+            except Exception as e:
+                logger.warning("Skipping source (unit %d): %s", unit_idx, e)
 
-    def _iter_source(self, source: str):
+    def _iter_source(self, source: Union[str, bytes]):
         """Yield pages from a single source one at a time."""
+        if isinstance(source, bytes):
+            if source[:5] == b"%PDF-":
+                yield from self._iter_pdf_bytes(source)
+            else:
+                yield Image.open(BytesIO(source))
+            return
+
         if source.startswith("file://"):
             file_path = source[7:]
         else:
@@ -186,10 +197,6 @@ class PageLoader:
 
     def _iter_pdf(self, file_path: str):
         """Yield PDF pages one at a time (streaming)."""
-        if not PYPDFIUM2_AVAILABLE:
-            raise RuntimeError(
-                "PDF support requires pypdfium2. Install: pip install pypdfium2"
-            )
         end_page = self._compute_end_page()
         for image in pdf_to_images_pil_iter(
             file_path,
@@ -200,11 +207,45 @@ class PageLoader:
         ):
             yield image
 
-    def _load_source(self, source: str) -> List[Image.Image]:
+    def _iter_pdf_bytes(self, data: bytes):
+        """Yield PDF pages from raw bytes one at a time."""
+        end_page = self._compute_end_page()
+        for image in pdf_to_images_pil_iter(
+            data,
+            dpi=self.pdf_dpi,
+            max_width_or_height=3500,
+            start_page_id=0,
+            end_page_id=end_page,
+        ):
+            yield image
+
+    def _load_pdf_bytes(self, data: bytes) -> List[Image.Image]:
+        """Load all pages from PDF bytes."""
+        t0 = time.perf_counter()
+        end_page = self._compute_end_page()
+        pages = pdf_to_images_pil(
+            data,
+            dpi=self.pdf_dpi,
+            max_width_or_height=3500,
+            start_page_id=0,
+            end_page_id=end_page,
+        )
+        profiler.log(
+            "pdf_to_images_pil(<bytes>)",
+            (time.perf_counter() - t0) * 1000,
+        )
+        return pages
+
+    def _load_source(self, source: Union[str, bytes]) -> List[Image.Image]:
         """Load a single source and return a list of pages.
 
         PDFs return all pages; images return a single-page list.
         """
+        if isinstance(source, bytes):
+            if source[:5] == b"%PDF-":
+                return self._load_pdf_bytes(source)
+            return [Image.open(BytesIO(source))]
+
         if source.startswith("file://"):
             file_path = source[7:]
         else:
@@ -240,11 +281,7 @@ class PageLoader:
             raise RuntimeError(f"Error loading image '{source}': {e}")
 
     def _load_pdf(self, file_path: str) -> List[Image.Image]:
-        """Load all pages from a PDF file using pypdfium2 (required)."""
-        if not PYPDFIUM2_AVAILABLE:
-            raise RuntimeError(
-                "PDF support requires pypdfium2. Install: pip install pypdfium2"
-            )
+        """Load all pages from a PDF file."""
         t0 = time.perf_counter()
         end_page = self._compute_end_page()
         pages = pdf_to_images_pil(
@@ -293,24 +330,6 @@ class PageLoader:
             if msg["role"] in ("system", "assistant", "tool"):
                 processed_messages.append(msg)
             elif msg["role"] in ("user", "observation"):
-                # If user provides images but no text, inject the default OCR instruction
-                if isinstance(msg.get("content"), list):
-                    has_image = any(
-                        c.get("type") == "image_url" for c in msg["content"]
-                    )
-                    has_text = any(
-                        c.get("type") == "text" and str(c.get("text", "")).strip()
-                        for c in msg["content"]
-                    )
-                    if has_image and not has_text:
-                        msg = {
-                            **msg,
-                            "content": [
-                                *msg["content"],
-                                {"type": "text", "text": self.default_prompt},
-                            ],
-                        }
-
                 processed_messages.append(self._process_msg_standard(msg))
             else:
                 raise ValueError(f"{msg['role']} is not a valid role for a message.")
@@ -333,37 +352,29 @@ class PageLoader:
         prompt_text = ""
         if self.task_prompt_mapping:
             prompt_text = self.task_prompt_mapping.get(task_type, "")
-        if not str(prompt_text).strip():
-            prompt_text = self.default_prompt
 
-        # Convert to RGB
-        if image.mode != "RGB":
-            image = image.convert("RGB")
+        encoded_image = load_image_to_base64(
+            image,
+            t_patch_size=self.t_patch_size,
+            max_pixels=self.max_pixels,
+            image_format=self.image_format,
+            patch_expand_factor=self.patch_expand_factor,
+            min_pixels=self.min_pixels,
+        )
 
-        # Encode image
-        buffered = BytesIO()
-        image.save(buffered, format=self.image_format)
-        img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-
-        original_msg = {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/{self.image_format.lower()};base64,{img_base64}"
-                    },
+        content: list = [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/{self.image_format.lower()};base64,{encoded_image}"
                 },
-            ],
-        }
-
+            },
+        ]
         if prompt_text:
-            original_msg["content"].append({"type": "text", "text": prompt_text})
-
-        processed_msg = self._process_msg_standard(original_msg)
+            content.append({"type": "text", "text": prompt_text})
 
         return {
-            "messages": [processed_msg],
+            "messages": [{"role": "user", "content": content}],
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,

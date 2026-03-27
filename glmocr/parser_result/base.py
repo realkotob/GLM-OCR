@@ -10,10 +10,9 @@ import re
 import traceback
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from glmocr.utils.logging import get_logger
-from glmocr.utils.markdown_utils import crop_and_replace_images
 
 logger = get_logger(__name__)
 
@@ -29,6 +28,8 @@ class BaseParserResult(ABC):
         json_result: Union[str, dict, list],
         markdown_result: Optional[str] = None,
         original_images: Optional[List[str]] = None,
+        image_files: Optional[Dict[str, Any]] = None,
+        raw_json_result: Optional[list] = None,
     ):
         """Initialize.
 
@@ -36,6 +37,10 @@ class BaseParserResult(ABC):
             json_result: JSON result (string, dict, or list).
             markdown_result: Markdown result (optional).
             original_images: Original image paths.
+            image_files: Mapping of ``filename`` → PIL Image for image-type
+                regions, to be saved under ``imgs/`` during :meth:`save`.
+            raw_json_result: Raw model output before post-processing;
+                saved as ``{name}_model.json`` alongside the final result.
         """
         if isinstance(json_result, str):
             try:
@@ -49,11 +54,13 @@ class BaseParserResult(ABC):
         self.original_images = [
             str(Path(p).absolute()) for p in (original_images or [])
         ]
+        self.image_files = image_files
+        self.raw_json_result = raw_json_result
 
     @abstractmethod
     def save(
         self,
-        output_dir: Union[str, Path] = "./results",
+        output_dir: Union[str, Path] = "./output",
         save_layout_visualization: bool = True,
     ) -> None:
         """Save result to disk. Subclasses implement layout vis etc."""
@@ -75,41 +82,46 @@ class BaseParserResult(ABC):
         # JSON
         json_file = output_path / f"{base_name}.json"
         try:
-            if isinstance(self.json_result, (dict, list)):
-                with open(json_file, "w", encoding="utf-8") as f:
-                    json.dump(self.json_result, f, ensure_ascii=False, indent=2)
-            elif isinstance(self.json_result, str):
+            json_data = self.json_result
+            if isinstance(json_data, str):
                 try:
-                    data = json.loads(self.json_result)
-                    with open(json_file, "w", encoding="utf-8") as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    json_data = json.loads(json_data)
                 except json.JSONDecodeError:
-                    with open(json_file, "w", encoding="utf-8") as f:
-                        f.write(self.json_result)
-            else:
-                with open(json_file, "w", encoding="utf-8") as f:
-                    json.dump(self.json_result, f, ensure_ascii=False, indent=2)
+                    pass
+            with open(json_file, "w", encoding="utf-8") as f:
+                if isinstance(json_data, (dict, list)):
+                    json.dump(json_data, f, ensure_ascii=False, indent=2)
+                else:
+                    f.write(str(json_data))
         except Exception as e:
             logger.warning("Failed to save JSON: %s", e)
             traceback.print_exc()
 
-        # Markdown (with image crop/replace if original_images)
+        # Raw model output (before post-processing)
+        if self.raw_json_result is not None:
+            raw_file = output_path / f"{base_name}_model.json"
+            try:
+                with open(raw_file, "w", encoding="utf-8") as f:
+                    json.dump(self.raw_json_result, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.warning("Failed to save raw JSON: %s", e)
+
+        # Markdown
         if self.markdown_result and self.markdown_result.strip():
-            md_text = self.markdown_result
-            if self.original_images:
-                try:
-                    imgs_dir = output_path / "imgs"
-                    md_text, _ = crop_and_replace_images(
-                        md_text,
-                        self.original_images,
-                        imgs_dir,
-                        image_prefix="cropped",
-                    )
-                except Exception as e:
-                    logger.warning("Failed to process image regions: %s", e)
             md_file = output_path / f"{base_name}.md"
             with open(md_file, "w", encoding="utf-8") as f:
-                f.write(md_text)
+                f.write(self.markdown_result)
+
+        # Image files produced by the result formatter
+        if self.image_files:
+            imgs_dir = output_path / "imgs"
+            imgs_dir.mkdir(parents=True, exist_ok=True)
+            for filename, img in self.image_files.items():
+                try:
+                    img.save(imgs_dir / filename, quality=95)
+                except Exception as e:
+                    logger.warning("Failed to save image %s: %s", filename, e)
+            self.image_files = None
 
     def to_dict(self) -> dict:
         """Return a JSON-serialisable dict of the result.
