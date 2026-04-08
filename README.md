@@ -166,6 +166,22 @@ For specialized deployment scenarios, see the detailed guides:
 - **[Apple Silicon with mlx-vlm](examples/mlx-deploy/README.md)** - Optimized for Apple Silicon Macs
 - **[Ollama Deployment](examples/ollama-deploy/README.md)** - Simple local deployment with Ollama
 
+#### Option 4: SDK Server + Client (GPU-less Client)
+
+Deploy the SDK Server on a GPU machine, then use any machine as a client — no GPU needed on the client side. The client connects via the MaaS-compatible protocol, pointing `api_url` at your self-hosted server.
+
+```yaml
+# Client config.yaml
+pipeline:
+  maas:
+    enabled: true
+    api_url: http://<SERVER_IP>:5002/glmocr/parse
+    api_key: any-string    # self-hosted server does not validate keys
+    verify_ssl: false
+```
+
+See the full guide: **[Self-hosted SDK Server + Client](examples/self-host/README.md)**
+
 #### Update Configuration
 
 After launching the service, configure `config.yaml`:

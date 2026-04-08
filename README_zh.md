@@ -164,6 +164,22 @@ sglang serve --model zai-org/GLM-OCR --port 8080 --speculative-algorithm NEXTN -
 - **[Apple Silicon 使用 mlx-vlm](examples/mlx-deploy/README.md)** - 针对 Apple Silicon Mac 优化
 - **[Ollama 部署](examples/ollama-deploy/README.md)** - 使用 Ollama 进行简单的本地部署
 
+#### 方式 4: SDK Server + Client（Client 无需 GPU）
+
+在 GPU 机器上部署 SDK Server，其他机器作为 Client 通过网络调用——Client 端无需 GPU。Client 通过 MaaS 兼容协议连接，将 `api_url` 指向自建 Server 即可。
+
+```yaml
+# Client 端 config.yaml
+pipeline:
+  maas:
+    enabled: true
+    api_url: http://<SERVER_IP>:5002/glmocr/parse
+    api_key: any-string    # 自建 Server 不校验 API key
+    verify_ssl: false
+```
+
+完整指南见：**[自部署 SDK Server + Client](examples/self-host/README.md)**
+
 ##### 更新配置
 
 启动服务后，配置 `config.yaml`：
