@@ -46,7 +46,7 @@ Edit `config.yaml`:
 pipeline:
   maas:
     enabled: true
-    api_url: http://<SERVER_IP>:5002/glmocr/parse
+    api_url: http://<SERVER_IP>:<SERVER_PORT>/glmocr/parse
     api_key: any-string        # Self-hosted server does not validate API keys
     verify_ssl: false          # Internal networks typically lack HTTPS
 ```
