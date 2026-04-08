@@ -1955,6 +1955,9 @@ class TestServerAcceptsMaaSInputFormat:
     @pytest.fixture()
     def flask_app(self):
         """Create a Flask test app with mocked pipeline."""
+        pytest.importorskip(
+            "flask", reason="server tests require 'glmocr[server]' extra"
+        )
         from glmocr.server import create_app
         from glmocr.config import load_config
 
@@ -2071,6 +2074,9 @@ class TestServerOutputMaaSCompatible:
     @pytest.fixture()
     def flask_app(self):
         """Create a Flask test app with mocked pipeline."""
+        pytest.importorskip(
+            "flask", reason="server tests require 'glmocr[server]' extra"
+        )
         from glmocr.server import create_app
         from glmocr.config import load_config
 
@@ -2360,6 +2366,9 @@ class TestMaaSClientServerProtocolRoundtrip:
     @pytest.fixture()
     def flask_app(self):
         """Create a Flask test app with mocked pipeline."""
+        pytest.importorskip(
+            "flask", reason="server tests require 'glmocr[server]' extra"
+        )
         from glmocr.server import create_app
         from glmocr.config import load_config
 
