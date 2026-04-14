@@ -119,7 +119,7 @@ docker pull vllm/vllm-openai:v0.19.0-ubuntu2404
 Or using with pip:
 
 ```bash
-pip install -U "vllm>=0.17.0"
+pip install -U "vllm>=0.19.0"
 ```
 
 Launch the service:
@@ -144,15 +144,13 @@ docker pull lmsysorg/sglang:v0.5.10
 Or using with pip:
 
 ```bash
-pip install "sglang>=0.5.9"
+pip install "sglang>=0.5.10"
 ```
 
 Launch the service:
 
 ```bash
-pip install "transformers>=5.3.0"
-
-sglang serve --model zai-org/GLM-OCR --port 8080 --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --served-model-name glm-ocr
+SGLANG_ENABLE_SPEC_V2=1 sglang serve --model-path zai-org/GLM-OCR --port 8080 --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --served-model-name glm-ocr
 ```
 
 >Note
